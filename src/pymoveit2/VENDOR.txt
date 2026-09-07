@@ -1,0 +1,15 @@
+pymoveit2 vendored snapshot
+==========================
+Upstream: https://github.com/AndrejOrsula/pymoveit2.git
+Upstream commit: 149c164 (build(deps): bump actions/setup-python from 6 to 7)
+
+Local patch (REQUIRED for chess demo):
+- pymoveit2/moveit2.py: replace rclpy.spin_once() polling loops with
+  time.sleep(0.01). The application node is already spun by the main
+  MultiThreadedExecutor; a second spin_once() on the same action client
+  corrupts the rclpy Humble wait set.
+- Affected methods: plan(), wait_until_executed(), get_fk(), get_ik()
+  (see git history of dofbot_ws for the exact diff).
+
+Do NOT replace this with a clean upstream checkout unless the patch above
+is re-applied, otherwise pick_place_node will hang/crash.

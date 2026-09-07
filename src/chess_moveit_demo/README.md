@@ -7,7 +7,7 @@ kiểm tra trọn luồng Stockfish, luật `python-chess`, ACK và visual đủ
 Nó không import hay chạy `pymoveit2`, `move_group` hoặc controller robot:
 
 ```bash
-cd ~/dofbot_ws
+cd ~/dofbot_tea_chess
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 launch chess_moveit_demo chess_base.launch.py
@@ -44,19 +44,26 @@ chess_brain_node          pick_place_node
   mở gripper theo từng loại quân — đây là những con số BẮT BUỘC PHẢI CHỈNH theo
   robot/bàn cờ ảo của bạn.
 
-## Cài đặt
+## Cài đặt (standalone, chỉ cần repo này)
 
 ```bash
-# trong ROS2 workspace, vd ~/ros2_ws/src
-cp -r chess_moveit_demo ~/ros2_ws/src/
+git clone <url> dofbot_tea_chess
+cd dofbot_tea_chess
+./setup_standalone.sh   # cài stockfish + python-chess, lấy dofbot_urdf, colcon build
+source install/setup.bash
+```
 
-pip install chess pymoveit2
-sudo apt install stockfish        # kiểm tra đường dẫn thật bằng: which stockfish
+Build lại sau khi sửa code (chạy tại workspace root):
 
-cd ~/ros2_ws
+```bash
+cd ~/dofbot_tea_chess
+source /opt/ros/humble/setup.bash
 colcon build --packages-select chess_moveit_demo
 source install/setup.bash
 ```
+
+Yêu cầu: `stockfish` (`which stockfish`), `pip install chess`,
+`pymoveit2` + `dofbot_moveit` đã vendored sẵn trong `src/`.
 
 ## Việc BẮT BUỘC phải chỉnh trước khi chạy
 
@@ -72,9 +79,8 @@ source install/setup.bash
    - `PICK_TCP_Z` → cao độ của **Gripping_point_Link** khi kẹp quân. Đây là
      tham số phải tune riêng (mặc định `0.055` m), không phải chiều cao quân.
    - `PIECE_SPECS` → chiều cao collision/visual và độ mở gripper từng loại quân.
-3. `launch/chess_sim.launch.py`:
-   - Đổi `your_robot_moveit_config` thành tên gói MoveIt2 config thật + tên
-   launch file (`demo.launch.py` hoặc tên khác bạn đã đặt).
+3. `launch/chess_sim.launch.py` dùng sẵn `dofbot_moveit` đã vendored trong
+   `src/` — không cần đổi gì thêm.
 
 ### Dofbot hiện có trong workspace này
 
@@ -88,6 +94,15 @@ source install/setup.bash
   L/R còn lại là mimic; không publish trực tiếp `/joint_states` để thử gripper.
 
 ## Chạy
+
+Mỗi terminal đều source trước:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/dofbot_tea_chess/install/setup.bash
+```
+
+Full sim (MoveIt + RViz):
 
 ```bash
 ros2 launch chess_moveit_demo chess_sim.launch.py

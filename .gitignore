@@ -8,3 +8,5 @@ build/
 install/
 log/
 .vscode/
+# Yahboom proprietary meshes (~104M), machine-provided via setup_standalone.sh
+src/dofbot_urdf
