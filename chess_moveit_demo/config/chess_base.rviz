@@ -1,0 +1,31 @@
+Panels:
+- Class: rviz_common/Displays
+  Name: Displays
+Visualization Manager:
+  Displays:
+  - Class: rviz_default_plugins/Grid
+    Name: Grid
+    Value: true
+  - Class: rviz_default_plugins/MarkerArray
+    Name: Chess board and pieces
+    Topic:
+      Durability Policy: Transient Local
+      Reliability Policy: Reliable
+      Value: /chess/visual
+    Value: true
+  Global Options:
+    Fixed Frame: world
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 0.55
+      Focal Point:
+        X: 0.19
+        Y: 0.0
+        Z: 0.03
+      Pitch: 0.9
+      Target Frame: world
+      Yaw: 0.0
+Window Geometry:
+  Height: 900
+  Width: 1200

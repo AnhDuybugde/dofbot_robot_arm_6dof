@@ -1,0 +1,36 @@
+default_velocity_scaling_factor: 0.10
+default_acceleration_scaling_factor: 0.10
+
+# Conservative limits for the tea task. The generated generic MoveIt config
+# says 1000 rad/s and has no acceleration limits, which is not physical.
+joint_limits:
+  Rlink1_Joint:
+      has_velocity_limits: true
+      max_velocity: 1.0
+      has_acceleration_limits: true
+      max_acceleration: 1.5
+  arm1_Joint:
+      has_velocity_limits: true
+      max_velocity: 1.0
+      has_acceleration_limits: true
+      max_acceleration: 1.5
+  arm2_Joint:
+      has_velocity_limits: true
+      max_velocity: 1.0
+      has_acceleration_limits: true
+      max_acceleration: 1.5
+  arm3_Joint:
+      has_velocity_limits: true
+      max_velocity: 1.0
+      has_acceleration_limits: true
+      max_acceleration: 1.5
+  arm4_Joint:
+      has_velocity_limits: true
+      max_velocity: 1.0
+      has_acceleration_limits: true
+      max_acceleration: 1.5
+  arm5_Joint:
+      has_velocity_limits: true
+      max_velocity: 1.0
+      has_acceleration_limits: true
+      max_acceleration: 1.5

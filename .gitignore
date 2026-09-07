@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.bak*
+*.bak
+*.before_*
+*.pre_final
+build/
+install/
+log/
+.vscode/
