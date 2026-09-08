@@ -2122,6 +2122,9 @@ class MoveIt2:
 
             self.__last_error_code = None
             self.__is_motion_requested = True
+            # Reset per-goal: lệnh mới chưa có kết quả thì không được đọc lại
+            # True của lệnh trước (reject/timeout sẽ giữ False).
+            self.motion_suceeded = False
             self.__send_goal_future_move_action = (
                 self.__move_action_client.send_goal_async(
                     goal=self.__move_action_goal,
@@ -2141,6 +2144,7 @@ class MoveIt2:
                     f"Action '{self.__move_action_client._action_name}' was rejected."
                 )
                 self.__is_motion_requested = False
+                self.motion_suceeded = False
                 return
 
             self.__execution_goal_handle = goal_handle
@@ -2154,15 +2158,17 @@ class MoveIt2:
 
     def __result_callback_move_action(self, res):
         with self.__execution_mutex:
-            if res.result().status != GoalStatus.STATUS_SUCCEEDED:
+            result = res.result()
+            if (result.status != GoalStatus.STATUS_SUCCEEDED
+                    or result.result.error_code.val != MoveItErrorCodes.SUCCESS):
                 self._node.get_logger().warning(
-                    f"Action '{self.__move_action_client._action_name}' was unsuccessful: {enum_to_str(GoalStatus, res.result().status)}."
+                    f"Action '{self.__move_action_client._action_name}' was unsuccessful: {enum_to_str(GoalStatus, result.status)}."
                 )
                 self.motion_suceeded = False
             else:
                 self.motion_suceeded = True
 
-            self.__last_error_code = res.result().result.error_code
+            self.__last_error_code = result.result.error_code
 
             self.__execution_goal_handle = None
             self.__is_executing = False
@@ -2180,6 +2186,8 @@ class MoveIt2:
 
             self.__last_error_code = None
             self.__is_motion_requested = True
+            # Reset per-goal (xem _send_goal_async_move_action).
+            self.motion_suceeded = False
             self.__send_goal_future_execute_trajectory = (
                 self._execute_trajectory_action_client.send_goal_async(
                     goal=goal,
@@ -2199,6 +2207,7 @@ class MoveIt2:
                     f"Action '{self._execute_trajectory_action_client._action_name}' was rejected."
                 )
                 self.__is_motion_requested = False
+                self.motion_suceeded = False
                 return
 
             self.__execution_goal_handle = goal_handle
@@ -2212,15 +2221,17 @@ class MoveIt2:
 
     def __result_callback_execute_trajectory(self, res):
         with self.__execution_mutex:
-            if res.result().status != GoalStatus.STATUS_SUCCEEDED:
+            result = res.result()
+            if (result.status != GoalStatus.STATUS_SUCCEEDED
+                    or result.result.error_code.val != MoveItErrorCodes.SUCCESS):
                 self._node.get_logger().warning(
-                    f"Action '{self._execute_trajectory_action_client._action_name}' was unsuccessful: {enum_to_str(GoalStatus, res.result().status)}."
+                    f"Action '{self._execute_trajectory_action_client._action_name}' was unsuccessful: {enum_to_str(GoalStatus, result.status)}."
                 )
                 self.motion_suceeded = False
             else:
                 self.motion_suceeded = True
 
-            self.__last_error_code = res.result().result.error_code
+            self.__last_error_code = result.result.error_code
 
             self.__execution_goal_handle = None
             self.__is_executing = False

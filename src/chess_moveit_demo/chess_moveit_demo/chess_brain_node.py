@@ -46,6 +46,15 @@ class ChessBrainNode(Node):
         self.timer = None
         self.game_running = False
         self.inflight_uci = None
+        self.inflight_move = None
+        # Fix 9: board của brain chỉ commit SAU ACK (không push khi quyết định),
+        # nên board luôn = trạng thái executor đã xác nhận xong. command_id +
+        # fen thay cho bare-UCI để ACK/NACK không thể khớp nhầm nước cũ.
+        self.inflight_cmd = None
+        self._next_command_id = 1
+        # Khóa restart sau lỗi chưa phục hồi: executor có thể đang giữ quân
+        # trên gripper/scene sai; cho start lại sẽ chạy tiếp trên scene sai.
+        self.locked_after_failure = False
         self.move_count = 0
         self.start_srv = self.create_service(Trigger, "/chess/start", self.start_game)
         self.get_logger().info(
@@ -56,6 +65,12 @@ class ChessBrainNode(Node):
         if self.game_running:
             response.success = False
             response.message = "Ván cờ đã chạy."
+            return response
+        if self.locked_after_failure:
+            response.success = False
+            response.message = (
+                "Game đang bị KHÓA sau lỗi chưa phục hồi (scene/executor có thể "
+                "sai). Restart launch rồi mới start ván mới.")
             return response
         self.game_running = True
         # Timer one-shot: tuyệt đối không polling/phát lại nước cờ theo chu kỳ.
@@ -93,54 +108,82 @@ class ChessBrainNode(Node):
         # pick_place_node để node đó là nguồn chân lý duy nhất cho board/visual/
         # planning scene, nhưng chỉ "robot" mới gửi trajectory tới MoveIt.
         execution = "robot" if piece.color == chess.WHITE else "virtual"
+        cmd = self._next_command_id
+        self._next_command_id += 1
         payload = {
+            "command_id": cmd,
+            "board_fen": self.board.fen(),
             "uci": move.uci(),
             "piece_type": piece.symbol().lower(),
             "execution": execution,
             "capture": self.board.is_capture(move),
             "castling": self.board.is_castling(move),
             "en_passant": self.board.is_en_passant(move),
-            # None hoặc p/n/b/r/q: pick-place dùng trường này để thay collision
-            # object của tốt bằng quân mới sau khi đến hàng cuối.
+            # Gợi ý hiển thị; executor SUY promotion từ nước hợp lệ, không tin
+            # trường này (xem _execute_move/_do_virtual_move).
             "promotion": chess.piece_symbol(move.promotion) if move.promotion else None,
         }
 
-        self.board.push(move)  # cập nhật board nội bộ CỦA BRAIN ngay khi quyết định
+        # Fix 9: KHÔNG push board ở đây. Board chỉ commit trong on_move_done khi
+        # ACK khớp command_id + uci — executor và brain không thể lệch nhau.
+        self.inflight_move = move
+        self.inflight_uci = move.uci()
+        self.inflight_cmd = cmd
         msg = String()
         msg.data = json.dumps(payload)
         self.move_pub.publish(msg)
         self.waiting_for_ack = True
-        self.inflight_uci = move.uci()
         self.last_pub_time = time.monotonic()
         self.move_count += 1
         # Log gọn terminal launch: thành công 1 dòng ngắn, lỗi mới chi tiết.
         self.get_logger().info(
-            f"[OK] nước {self.move_count}: {move.uci()} ({execution})"
+            f"[OK] nước {self.move_count}: {move.uci()} ({execution}) [cmd={cmd}]"
         )
+
+    @staticmethod
+    def _parse_ack(data: str):
+        """Tách '<cmd>:<uci>[: <reason>]'; legacy bare-uci -> cmd=0."""
+        parts = data.split(":", 2)
+        if len(parts) >= 2 and parts[0].strip().lstrip("-").isdigit():
+            cmd = int(parts[0].strip())
+            rest = parts[1].strip()
+            reason = parts[2].strip() if len(parts) > 2 else ""
+            return cmd, rest, reason
+        return 0, data.strip(), ""
 
     def on_move_done(self, msg: String):
         if not self.waiting_for_ack:
             self.get_logger().warning(f"[FAIL] ACK dư thừa (không chờ): {msg.data}")
             return
-        if msg.data != self.inflight_uci:
+        cmd, uci, _ = self._parse_ack(msg.data)
+        if uci != self.inflight_uci or not (cmd == self.inflight_cmd or cmd == 0):
             self.get_logger().warning(
-                f"[FAIL] ACK sai nước: nhận {msg.data}, đang chờ {self.inflight_uci}"
+                f"[FAIL] ACK sai nước: nhận cmd={cmd} {uci}, đang chờ "
+                f"cmd={self.inflight_cmd} {self.inflight_uci}"
             )
             return
+        if cmd == 0:
+            self.get_logger().warning(
+                "[WARN] ACK legacy không có command_id; chấp nhận theo UCI.")
+        # Commit board SAU ACK khớp — đây mới là lúc nước đi chắc chắn xong.
+        self.board.push(self.inflight_move)
         self.waiting_for_ack = False
         self.inflight_uci = None
+        self.inflight_move = None
+        self.inflight_cmd = None
         # Chỉ ACK thành công mới dẫn đến đúng một nước kế tiếp.
         self._schedule_next_tick(0.3)
 
     def on_move_failed(self, msg: String):
-        """NACK từ pick_place (format '<uci>: <lý do>'). Dừng game tường minh."""
-        uci = msg.data.split(":", 1)[0].strip()
+        """NACK từ pick_place (format '<cmd>:<uci>: <lý do>'). Dừng game tường minh."""
+        cmd, uci, _ = self._parse_ack(msg.data)
         if not self.waiting_for_ack:
             self.get_logger().warning(f"[FAIL] NACK dư thừa (không chờ): {msg.data}")
             return
-        if uci not in ("?", self.inflight_uci):
+        if uci not in (self.inflight_uci, "?") or not (cmd == self.inflight_cmd or cmd == 0):
             self.get_logger().warning(
-                f"[FAIL] NACK sai nước: nhận {msg.data}, đang chờ {self.inflight_uci}"
+                f"[FAIL] NACK sai nước: nhận cmd={cmd} {msg.data}, đang chờ "
+                f"cmd={self.inflight_cmd} {self.inflight_uci}"
             )
             return
         self._stop_game(f"nước {self.inflight_uci} thất bại phía robot: {msg.data}")
@@ -149,8 +192,14 @@ class ChessBrainNode(Node):
         self.game_running = False
         self.waiting_for_ack = False
         self.inflight_uci = None
+        self.inflight_move = None
+        self.inflight_cmd = None
+        # Khóa restart: board brain chưa commit nước lỗi, executor có thể kẹt
+        # scene — start lại mù sẽ chạy tiếp trên trạng thái sai (Fix 9).
+        self.locked_after_failure = True
         self.get_logger().error(
-            f"[FAIL] Game DỪNG: {reason}. Cần restart launch để chơi ván mới."
+            f"[FAIL] Game DỪNG + KHÓA restart: {reason}. "
+            f"Cần restart launch để chơi ván mới."
         )
 
     def _watchdog(self):

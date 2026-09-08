@@ -34,8 +34,8 @@ LOW_APPROACH_SQUARES = frozenset({"c1", "d1", "e1", "f1"})
 #   d1 (0.095, -0.014): OK ở z<=0.080, FAIL từ 0.090 trở lên
 # c1/f1 (lệch tâm) OK ở 0.100. Vì vậy e1/d1 dùng offset approach riêng thấp
 # hơn (giá trị = cao độ TCP tuyệt đối đã verify có IK):
-#   e1 -> 0.070, d1 -> 0.080. Quân mục tiêu đã được gỡ khỏi scene trước khi
-# plan pre-grasp nên approach thấp không gây va chạm giả với chính nó.
+#   e1 -> 0.070, d1 -> 0.080. Khi gắp, ACM chỉ mở contact tạm thời giữa quân
+# mục tiêu với link kẹp/mặt bàn; các collision khác vẫn được kiểm tra.
 SQUARE_APPROACH_OFFSET = {"e1": 0.015, "d1": 0.025}
 # Cao độ TCP (Gripping_point_Link) tại lúc ngón kẹp đúng quân. Đây là tham số
 # calibration của ROBOT, không phải chiều cao của quân.  Bắt đầu ở 55 mm để
@@ -43,17 +43,26 @@ SQUARE_APPROACH_OFFSET = {"e1": 0.015, "d1": 0.025}
 PICK_TCP_Z = 0.055
 DISCARD_TCP_Z = PICK_TCP_Z
 
-# Chế độ tạm thời chỉ dành cho RViz + ros2_control FakeSystem: không đưa bàn
-# và quân vào collision checking. Dùng để xác nhận toàn bộ chuỗi game -> arm
-# -> ACK trước khi tinh chỉnh hình học gripper. PHẢI đặt lại False trước khi
-# điều khiển robot thật.
-SIMULATION_IGNORE_COLLISIONS = True
+# Hai cờ này CỐ Ý độc lập. Bật collision không được làm deep-check đổi từ
+# EXECUTE sang plan-only, vì cần kiểm tra đúng state chaining trên FakeSystem.
+# Khi chuyển sang arm thật, đặt REACHABILITY_EXECUTE_ON_FAKESYSTEM=False.
+COLLISION_ENABLED = True
+REACHABILITY_EXECUTE_ON_FAKESYSTEM = True
 
 # Cartesian descend/lift KHÔNG được fallback âm thầm sang position-only.
 # Fallback cũ chỉ warning rồi đi tiếp, khiến pick thất bại mà flow vẫn
 # đóng gripper/attach object như thành công. Giữ False để lỗi hiện rõ;
 # chỉ bật True khi demo và chấp nhận rủi ro đó một cách tường minh.
 ALLOW_CARTESIAN_FALLBACK = False
+
+# Tổng thời gian tối đa cho tìm candidate gắp 1 ô (Fix 6): thử offset mà
+# không trần thời gian có thể treo lượt đi khi scene khó. Hết trần -> raise
+# để NACK thay vì thử mãi.
+GRASP_SEARCH_TIMEOUT_SEC = 120.0
+# Bán kính collision của quân (12 mm, xem _add_piece_collision_at). Candidate
+# offset vượt quá bán kính này thì ngón kẹp chắc chắn trượt tâm quân (điều
+# kiện hình học tối thiểu; FakeSystem không kiểm chứng tiếp xúc vật lý thật).
+GRASP_MAX_OFFSET = 0.012
 
 FILES = "abcdefgh"
 RANKS = "12345678"
@@ -101,6 +110,21 @@ PIECE_GRIP_Z = {
     "k": PICK_TCP_Z,  # king, cao 75 mm
 }
 
+# Candidate lệch tâm cho GẮP, tính bằng mét. Pipeline luôn thử tâm trước, rồi
+# mở rộng hữu hạn 3 -> 6 -> 8 mm; không tìm vô hạn và không mở collision với
+# quân lân cận. 8 mm vẫn nằm trong nửa ô 13.5 mm của bàn hiện tại. Điểm đặt,
+# collision object và visual của quân luôn ở tâm ô.
+GRASP_APPROACH_CANDIDATE_OFFSETS = (
+    (0.0, 0.0),
+    (0.003, 0.0), (-0.003, 0.0), (0.0, 0.003), (0.0, -0.003),
+    (0.006, 0.0), (-0.006, 0.0), (0.0, 0.006), (0.0, -0.006),
+    (0.006, 0.006), (0.006, -0.006),
+    (-0.006, 0.006), (-0.006, -0.006),
+    (0.008, 0.0), (-0.008, 0.0), (0.0, 0.008), (0.0, -0.008),
+    (0.008, 0.008), (0.008, -0.008),
+    (-0.008, 0.008), (-0.008, -0.008),
+)
+
 
 def square_to_xy(square: str):
     """'e4' -> (x, y) tâm ô, chưa cộng offset lệch tâm quân."""
@@ -124,6 +148,12 @@ def square_to_grasp_pose(square: str, piece_type: str, offset_xy=(0.0, 0.0)):
     x, y = square_to_xy(square)
     x += offset_xy[0]
     y += offset_xy[1]
+    return x, y, PIECE_GRIP_Z.get(piece_type, PICK_TCP_Z)
+
+
+def square_to_place_pose(square: str, piece_type: str):
+    """TCP khi đặt quân tại tâm ô; không áp dụng offset clearance của pick."""
+    x, y = square_to_xy(square)
     return x, y, PIECE_GRIP_Z.get(piece_type, PICK_TCP_Z)
 
 
