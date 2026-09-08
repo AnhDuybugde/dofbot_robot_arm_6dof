@@ -8,6 +8,7 @@ Cài đặt:
 """
 
 import json
+import time
 
 import chess
 import chess.engine
@@ -31,10 +32,21 @@ class ChessBrainNode(Node):
         self.ack_sub = self.create_subscription(
             String, "/chess/move_done", self.on_move_done, 10
         )
+        # NACK từ pick_place: lỗi thực thi phải dừng game tường minh thay vì
+        # treo ở waiting_for_ack vô hạn (không ACK nào bao giờ tới).
+        self.fail_sub = self.create_subscription(
+            String, "/chess/move_failed", self.on_move_failed, 10
+        )
+        self.last_pub_time = 0.0
+        # Watchdog: lưới an toàn cuối cho trường hợp không ACK lẫn không NACK
+        # (vd. worker thread chết bất thường). Ngưỡng 600s đủ rộng cho mọi nước
+        # plan/execute bình thường.
+        self.watchdog = self.create_timer(5.0, self._watchdog)
         self.waiting_for_ack = False
         self.timer = None
         self.game_running = False
         self.inflight_uci = None
+        self.move_count = 0
         self.start_srv = self.create_service(Trigger, "/chess/start", self.start_game)
         self.get_logger().info(
             "Chess brain sẵn sàng. Bàn cờ đang chờ: ros2 service call /chess/start std_srvs/srv/Trigger '{}'"
@@ -77,9 +89,14 @@ class ChessBrainNode(Node):
         move = result.move
         piece = self.board.piece_at(move.from_square)
 
+        # Trắng là người điều khiển robot; Đen là đối thủ ảo. Cả hai vẫn đi qua
+        # pick_place_node để node đó là nguồn chân lý duy nhất cho board/visual/
+        # planning scene, nhưng chỉ "robot" mới gửi trajectory tới MoveIt.
+        execution = "robot" if piece.color == chess.WHITE else "virtual"
         payload = {
             "uci": move.uci(),
             "piece_type": piece.symbol().lower(),
+            "execution": execution,
             "capture": self.board.is_capture(move),
             "castling": self.board.is_castling(move),
             "en_passant": self.board.is_en_passant(move),
@@ -94,21 +111,55 @@ class ChessBrainNode(Node):
         self.move_pub.publish(msg)
         self.waiting_for_ack = True
         self.inflight_uci = move.uci()
-        self.get_logger().info(f"Nước đi: {payload}")
+        self.last_pub_time = time.monotonic()
+        self.move_count += 1
+        # Log gọn terminal launch: thành công 1 dòng ngắn, lỗi mới chi tiết.
+        self.get_logger().info(
+            f"[OK] nước {self.move_count}: {move.uci()} ({execution})"
+        )
 
     def on_move_done(self, msg: String):
         if not self.waiting_for_ack:
-            self.get_logger().warning(f"Bỏ ACK dư thừa: {msg.data}")
+            self.get_logger().warning(f"[FAIL] ACK dư thừa (không chờ): {msg.data}")
             return
         if msg.data != self.inflight_uci:
             self.get_logger().warning(
-                f"Bỏ ACK sai nước: nhận {msg.data}, đang chờ {self.inflight_uci}"
+                f"[FAIL] ACK sai nước: nhận {msg.data}, đang chờ {self.inflight_uci}"
             )
             return
         self.waiting_for_ack = False
         self.inflight_uci = None
         # Chỉ ACK thành công mới dẫn đến đúng một nước kế tiếp.
         self._schedule_next_tick(0.3)
+
+    def on_move_failed(self, msg: String):
+        """NACK từ pick_place (format '<uci>: <lý do>'). Dừng game tường minh."""
+        uci = msg.data.split(":", 1)[0].strip()
+        if not self.waiting_for_ack:
+            self.get_logger().warning(f"[FAIL] NACK dư thừa (không chờ): {msg.data}")
+            return
+        if uci not in ("?", self.inflight_uci):
+            self.get_logger().warning(
+                f"[FAIL] NACK sai nước: nhận {msg.data}, đang chờ {self.inflight_uci}"
+            )
+            return
+        self._stop_game(f"nước {self.inflight_uci} thất bại phía robot: {msg.data}")
+
+    def _stop_game(self, reason: str):
+        self.game_running = False
+        self.waiting_for_ack = False
+        self.inflight_uci = None
+        self.get_logger().error(
+            f"[FAIL] Game DỪNG: {reason}. Cần restart launch để chơi ván mới."
+        )
+
+    def _watchdog(self):
+        if self.game_running and self.waiting_for_ack and self.last_pub_time:
+            stalled = time.monotonic() - self.last_pub_time
+            if stalled > 600.0:
+                self._stop_game(
+                    f"treo {stalled:.0f}s không ACK/NACK cho {self.inflight_uci}"
+                )
 
     def destroy_node(self):
         self.engine.quit()

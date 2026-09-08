@@ -44,6 +44,12 @@ DISCARD_TCP_Z = PICK_TCP_Z
 # điều khiển robot thật.
 SIMULATION_IGNORE_COLLISIONS = True
 
+# Cartesian descend/lift KHÔNG được fallback âm thầm sang position-only.
+# Fallback cũ chỉ warning rồi đi tiếp, khiến pick thất bại mà flow vẫn
+# đóng gripper/attach object như thành công. Giữ False để lỗi hiện rõ;
+# chỉ bật True khi demo và chấp nhận rủi ro đó một cách tường minh.
+ALLOW_CARTESIAN_FALLBACK = False
+
 FILES = "abcdefgh"
 RANKS = "12345678"
 
@@ -64,8 +70,31 @@ PIECE_SPECS = {
     "k": PieceSpec(pickup_height=0.075, gripper_open=0.020),  # king
 }
 
-DISCARD_ZONE = (0.16, 0.14, 0.005)  # vị trí "nghĩa địa" quân bị ăn, so với base_link
-DISCARD_SPACING = 0.025
+# "Nghĩa địa" quân bị ăn: lưới 4x4=16 slot cạnh bàn phía -Y (bên file a),
+# x nằm trong tầm file bàn cờ đã test, y chỉ ngoài mép bàn ~1 ô. Bán kính lớn
+# nhất (slot 15) ~0.30 m, tương đương góc h8 đã pass 64/64.
+# Bản cũ xếp 1 hàng dọc +Y vô hạn (slot thứ 6 đã y=0.265, ngoài tầm với thật:
+# Cartesian chỉ được 40% rồi OMPL cũng bó tay) — lỗi này làm treo game vì quân
+# đang attached mà không có ACK.
+DISCARD_ORIGIN = (0.09, -0.13, BOARD_Z)
+DISCARD_COLS = 4
+DISCARD_ROWS = 4
+DISCARD_DX = 0.033
+DISCARD_DY = 0.033
+DISCARD_MAX_SLOTS = DISCARD_COLS * DISCARD_ROWS  # 16
+
+# Cao độ TCP khi kẹp từng loại quân. Mặc định = PICK_TCP_Z cho tất cả để giữ
+# nguyên hành vi đã verify trong sim; tune từng loại trên RViz/robot thật
+# (quân cao như q/k có thể cần TCP cao hơn để ngón kẹp đúng thân thay vì
+# chạm đỉnh quân). Service /chess/check_reachability đã test theo bảng này.
+PIECE_GRIP_Z = {
+    "p": PICK_TCP_Z,  # pawn, cao 35 mm
+    "n": PICK_TCP_Z,  # knight, cao 45 mm
+    "b": PICK_TCP_Z,  # bishop, cao 55 mm
+    "r": PICK_TCP_Z,  # rook, cao 45 mm
+    "q": PICK_TCP_Z,  # queen, cao 70 mm
+    "k": PICK_TCP_Z,  # king, cao 75 mm
+}
 
 
 def square_to_xy(square: str):
@@ -80,9 +109,9 @@ def square_to_xy(square: str):
 def square_to_grasp_pose(square: str, piece_type: str, offset_xy=(0.0, 0.0)):
     """Trả về (x, y, z) TCP khi gắp, cộng offset lệch tâm nếu có.
 
-    `z` là PICK_TCP_Z đã hiệu chuẩn cho Gripping_point_Link; không suy ra từ
-    chiều cao quân.  Chiều cao quân chỉ phục vụ visual/collision và offset khi
-    attach object vào gripper.
+    `z` tra từ PIECE_GRIP_Z theo loại quân (mặc định = PICK_TCP_Z cho mọi
+    loại cho tới khi tune vật lý). Chiều cao quân (PIECE_SPECS) chỉ phục vụ
+    visual/collision và offset khi attach object vào gripper.
 
     Cộng offset lệch tâm nếu có
     (offset_xy mô phỏng vai trò của position-regression model trong bản gốc;
@@ -90,7 +119,7 @@ def square_to_grasp_pose(square: str, piece_type: str, offset_xy=(0.0, 0.0)):
     x, y = square_to_xy(square)
     x += offset_xy[0]
     y += offset_xy[1]
-    return x, y, PICK_TCP_Z
+    return x, y, PIECE_GRIP_Z.get(piece_type, PICK_TCP_Z)
 
 
 def approach_tcp_z(square: str, pick_tcp_z: float = PICK_TCP_Z) -> float:
@@ -113,7 +142,13 @@ def approach_tcp_z(square: str, pick_tcp_z: float = PICK_TCP_Z) -> float:
 
 
 def discard_slot_pose(index: int):
-    x, y, z = DISCARD_ZONE
-    x += (index // 8) * DISCARD_SPACING
-    y += (index % 8) * DISCARD_SPACING
-    return x, y, z
+    if index < 0 or index >= DISCARD_MAX_SLOTS:
+        raise ValueError(
+            f"Slot nghĩa địa {index} vượt lưới {DISCARD_COLS}x{DISCARD_ROWS} "
+            f"({DISCARD_MAX_SLOTS} slot). Ván cờ đã ăn quá nhiều quân cho layout này."
+        )
+    col = index % DISCARD_COLS
+    row = index // DISCARD_COLS
+    x = DISCARD_ORIGIN[0] + col * DISCARD_DX
+    y = DISCARD_ORIGIN[1] - row * DISCARD_DY
+    return x, y, DISCARD_ORIGIN[2]

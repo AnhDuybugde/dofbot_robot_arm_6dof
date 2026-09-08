@@ -7,14 +7,27 @@ from ament_index_python.packages import get_package_share_directory
 from moveit_configs_utils import MoveItConfigsBuilder
 
 def generate_launch_description():
-    cfg=MoveItConfigsBuilder(
-        "dofbot",
-        package_name="dofbot_moveit"
-    ).to_moveit_configs()
-
     tea_share=get_package_share_directory(
         "dofbot_tea_moveit"
     )
+
+    # Giới hạn conservative của task trà (1.0 rad/s). File generic của
+    # dofbot_moveit để 1000 rad/s và không có accel limit — trước đây file này
+    # là orphan, không launch nào load, nên move_group chạy với limit ảo.
+    joint_limits=os.path.join(
+        tea_share,
+        "config",
+        "tea_joint_limits.yaml"
+    )
+
+    cfg=MoveItConfigsBuilder(
+        "dofbot",
+        package_name="dofbot_moveit"
+    ).robot_description(
+        file_path="config/dofbot.urdf.xacro"
+    ).joint_limits(
+        joint_limits
+    ).to_moveit_configs()
 
     moveit_share=get_package_share_directory(
         "dofbot_moveit"

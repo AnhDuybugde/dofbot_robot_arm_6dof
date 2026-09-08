@@ -16,9 +16,9 @@ ros2 launch chess_moveit_demo chess_base.launch.py
 Trong terminal khác gọi `ros2 service call /chess/start std_srvs/srv/Trigger '{}'`.
 
 Khung sườn end-to-end: robot 6DOF "chơi cờ" trong RViz/MoveIt2, không cần camera
-hay bàn cờ thật — Stockfish tự chơi cả 2 bên (self-play), robot mô phỏng thực
-hiện pick-place từng nước đi, va chạm giữa các quân được MoveIt2 tự tránh nhờ
-Planning Scene được cập nhật động sau mỗi nước.
+hay bàn cờ thật — Stockfish tự chơi cả 2 bên (self-play). Robot mô phỏng chỉ
+thực hiện quân Trắng; quân Đen tự dịch marker/Planning Scene. Các lượt robot
+dùng MoveIt2 với Planning Scene được cập nhật động.
 
 ## Kiến trúc
 
@@ -31,12 +31,14 @@ chess_brain_node          pick_place_node
                                         gripper)
 ```
 
-- `chess_brain_node`: giữ 1 `chess.Board()`, mỗi giây hỏi Stockfish 1 nước đi
-  (cho cả bên trắng lẫn đen), publish JSON `{uci, piece_type, capture, castling,
-  en_passant}` lên `/chess/move`, rồi CHỜ tín hiệu `/chess/move_done` mới đi tiếp.
+- `chess_brain_node`: giữ 1 `chess.Board()`, hỏi Stockfish lần lượt từng nước.
+  Payload có `execution`: quân **Trắng** là `robot` (arm gắp/thả), quân **Đen**
+  là `virtual` (tự dịch marker/scene, arm đứng yên). Brain luôn CHỜ
+  `/chess/move_done` trước nước kế tiếp.
 - `pick_place_node`: nhận nước đi, phân rã thành
-  Pre-grasp → Cartesian Pick → Lift → Move → Cartesian Place → Return Home
-  (thêm bước "discard" nếu ăn quân, và 2 lần pick-place nếu nhập thành), gọi
+  HOME joint PTP → Pre-grasp (OMPL) → Cartesian Pick/Lift → Move (OMPL) →
+  Cartesian Place → HOME joint PTP (thêm bước "discard" nếu ăn quân, và 2 lần
+  pick-place nếu nhập thành), gọi
   MoveIt2 thực thi, đồng thời
   add/remove/move các collision object (box cho bàn cờ, cylinder cho từng quân)
   trong `chess_utils.py`.
@@ -102,28 +104,38 @@ source /opt/ros/humble/setup.bash
 source ~/dofbot_tea_chess/install/setup.bash
 ```
 
-Full sim (MoveIt + RViz):
+Lite sim mặc định (MoveIt + RViz nhẹ):
 
 ```bash
 ros2 launch chess_moveit_demo chess_sim.launch.py
 ```
 
-RViz sẽ mở lên với robot và đủ bàn cờ. Khi muốn bắt đầu self-play, mở terminal
+RViz mở với robot và đủ bàn cờ, nhưng robot là `dofbot_lite` (14 box primitive
+thay cho mesh STL high-poly) và `MotionPlanning` tắt để tránh render planning
+scene/trajectory nặng (phù hợp máy yếu). Link/joint, IK và collision của MoveIt
+không đổi. Khi cần debug quỹ đạo, tick
+`MotionPlanning (enable for trajectory)` trong panel **Displays**; FPS sẽ giảm.
+Khi muốn bắt đầu self-play, mở terminal
 khác (đã source workspace) rồi gọi:
 
 ```bash
 ros2 service call /chess/start std_srvs/srv/Trigger '{}'
 ```
 
-Node brain sẽ publish nước đi đầu tiên và robot bắt đầu di chuyển quân cờ qua
-lại giữa các ô.
+Node brain sẽ publish nước Trắng đầu tiên để robot thực hiện; sau ACK, nước
+Đen tự cập nhật trên RViz rồi tới lượt Trắng kế tiếp.
 
 Trước khi bấm `/chess/start`, kiểm tra vùng làm việc của đúng vị trí bàn hiện
-tại (lệnh này chỉ lập plan, **không** di chuyển arm):
+tại (2 tầng: quét nhanh 64 ô + dry-run đúng chuỗi runtime trên 12 ô đại diện
+và khu discard):
 
 ```bash
 ros2 service call /chess/check_reachability std_srvs/srv/Trigger '{}'
 ```
+
+Ở sim (FakeSystem) tầng deep **có di chuyển arm thật** (execute dry-run không
+kẹp quân); ở robot thật chỉ plan-only. `success=False` nếu bất kỳ phase nào
+(approach/hạ/nâng Cartesian/chuyển ô/discard) lỗi — khác bản cũ luôn True.
 
 Terminal đang chạy launch sẽ in danh sách ô không có IK ở cả `approach` và
 `pick`. Bảng approach đã đo IK thực tế (KDL position-only): `c1`/`f1` dùng
@@ -146,7 +158,9 @@ Có. Bản này dùng cơ chế **attach/detach collision object** đúng chuẩ
   này được thêm lại ngay tại ô nguồn.
 - Lúc gripper vừa đóng, `_attach_piece()` gắn object vào `END_EFFECTOR` với
   offset lấy từ TF của TCP, đồng thời khai báo các link ngón là `touch_links`.
-  Trong suốt Lift → Move, quân cờ trôi theo cánh tay thật sự trên RViz.
+  Trong suốt Lift → Move, marker visual cũng đổi sang frame
+  `Gripping_point_Link`, nên quân cờ trôi theo cánh tay thật sự trên RViz, kể
+  cả trong FakeSystem đang tắt collision object.
 - Lúc gripper vừa mở ở bước Place → `_detach_piece()` gỡ khỏi tay, thêm lại
   thành world object đứng yên tại ô đích.
 

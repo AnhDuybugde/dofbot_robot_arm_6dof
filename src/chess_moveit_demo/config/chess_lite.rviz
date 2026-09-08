@@ -8,11 +8,13 @@ Visualization Manager:
   - Class: rviz_default_plugins/Grid
     Name: Grid
     Value: true
-  - Alpha: 0.8
-    Class: rviz_default_plugins/RobotModel
-    Description Topic:
-      Value: /robot_description
-    Name: Robot Model
+  # RobotModel nhẹ hơn MotionPlanning: chỉ render visual robot, không tải
+  # planning scene/trajectory widget khi mở RViz.
+  - Class: rviz_default_plugins/RobotModel
+    Name: Robot
+    Robot Description: robot_description
+    Visual Enabled: true
+    Collision Enabled: false
     Value: true
   # MoveIt planning scene và quỹ đạo: bật lại để debug giống profile full.
   - Class: moveit_rviz_plugin/MotionPlanning
@@ -28,21 +30,21 @@ Visualization Manager:
       Scene Alpha: 0.2
       Show Scene Geometry: false
     Scene Robot:
-      Robot Alpha: 0.5
+      Robot Alpha: 0.75
       Show Robot Collision: false
-      Show Robot Visual: false
+      Show Robot Visual: true
     Octomap:
       Show Octomap: false
     Value: true
   - Class: rviz_default_plugins/MarkerArray
     Enabled: true
-    Name: Tea Scene
+    Name: Chess board and pieces
     Topic:
-      Depth: 5
+      Depth: 10
       Durability Policy: Transient Local
       History Policy: Keep Last
       Reliability Policy: Reliable
-      Value: /tea_scene
+      Value: /chess/visual
     Value: true
   Global Options:
     Fixed Frame: base_link
@@ -54,15 +56,15 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 0.8
+      Distance: 0.55
       Focal Point:
-        X: 0.08
+        X: 0.13
         Y: 0.0
-        Z: 0.12
-      Name: Current View
-      Pitch: 0.45
+        Z: 0.06
+      Name: Chessboard view
+      Pitch: 0.9
       Target Frame: base_link
-      Yaw: -0.7
+      Yaw: 0.0
 Window Geometry:
-  Height: 800
+  Height: 900
   Width: 1200

@@ -10,6 +10,8 @@ def generate_launch_description():
     cfg=MoveItConfigsBuilder(
         "dofbot",
         package_name="dofbot_moveit"
+    ).robot_description(
+        file_path="config/dofbot.urdf.xacro"
     ).to_moveit_configs()
 
     tea_share=get_package_share_directory(

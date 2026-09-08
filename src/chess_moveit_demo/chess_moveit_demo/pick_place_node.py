@@ -33,8 +33,10 @@ from visualization_msgs.msg import Marker, MarkerArray
 from pymoveit2 import MoveIt2
 
 from .chess_utils import (
+    ALLOW_CARTESIAN_FALLBACK,
     APPROACH_HEIGHT,
     BOARD_Z,
+    DISCARD_MAX_SLOTS,
     DISCARD_TCP_Z,
     PIECE_SPECS,
     SIMULATION_IGNORE_COLLISIONS,
@@ -58,6 +60,9 @@ GRIPPER_TOUCH_LINKS = [
     "Rlink1_Link", "Rlink2_Link", "Rlink3_Link",
     "Llink1_Link", "Llink2_Link", "Llink3_Link",
 ]
+# SRDF `arm_group/up`: pose joint đã biết, dùng làm điểm đầu/cuối ổn định cho
+# mỗi lượt robot. Đây là joint-goal (PTP), không phải Cartesian target.
+HOME_JOINTS = [0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 class PickPlaceNode(Node):
@@ -90,6 +95,7 @@ class PickPlaceNode(Node):
 
         self.board = chess.Board()
         self.discard_count = 0
+        self.carried_piece_id: str | None = None
         self._id_counter = itertools.count()
         # ID collision object KHÔNG suy ra từ tên ô (vì ô sẽ được quân khác chiếm
         # lại sau này) - mỗi quân giữ 1 id cố định, theo dõi vị trí hiện tại qua dict.
@@ -111,6 +117,14 @@ class PickPlaceNode(Node):
         )
 
         self.done_pub = self.create_publisher(String, "/chess/move_done", 10)
+        # NACK: mọi lỗi thực thi đều báo về brain để dừng chờ ACK, thay vì treo
+        # game âm thầm (brain chờ ACK vô hạn). Format: "<uci>: <lý do>".
+        self.fail_pub = self.create_publisher(String, "/chess/move_failed", 10)
+        # Guard race: on_move spawn thread mỗi message; 2 thread _execute_move
+        # song song sẽ xé board/piece maps dùng chung. Flow chuẩn đã ACK-gated
+        # nên cờ này chỉ chặn publish thủ công chồng lệnh.
+        self._exec_lock = threading.Lock()
+        self._executing = False
         self.move_sub = self.create_subscription(
             String, "/chess/move", self.on_move, 10, callback_group=cb_group
         )
@@ -229,6 +243,46 @@ class PickPlaceNode(Node):
         if publish:
             self._publish_all_visual()
 
+    def _publish_carried_piece_visual(self, obj_id: str, local_pose: Pose):
+        """Đổi marker quân sang frame TCP.
+
+        RViz tự cập nhật theo TF của Gripping_point_Link trong lúc lift/transfer,
+        nên không cần timer hay publish liên tục. Cơ chế này hoạt động cả khi
+        demo bỏ collision object khỏi PlanningScene.
+        """
+        piece_type, is_white = self.piece_info_by_id[obj_id]
+        spec = PIECE_SPECS[piece_type]
+        marker = Marker()
+        marker.header.frame_id = END_EFFECTOR
+        marker.ns = "chess_pieces"
+        marker.id = int(obj_id.rsplit("_", 1)[1])
+        marker.type = Marker.CYLINDER
+        marker.action = Marker.ADD
+        marker.pose = local_pose
+        marker.scale.x = marker.scale.y = 0.021
+        marker.scale.z = spec.pickup_height
+        if is_white:
+            marker.color.r, marker.color.g, marker.color.b = 0.96, 0.96, 0.88
+        else:
+            marker.color.r, marker.color.g, marker.color.b = 0.08, 0.10, 0.13
+        marker.color.a = 1.0
+        self._visual_markers[marker.id] = marker
+        self.carried_piece_id = obj_id
+        self._publish_all_visual()
+
+    def _delete_piece_visual(self, obj_id: str):
+        """Xoá quân bị Đen ăn trong lượt virtual khỏi snapshot RViz."""
+        marker_id = int(obj_id.rsplit("_", 1)[1])
+        self._visual_markers.pop(marker_id, None)
+        delete = Marker()
+        delete.header.frame_id = BASE_LINK
+        delete.ns = "chess_pieces"
+        delete.id = marker_id
+        delete.action = Marker.DELETE
+        self.visual_pub.publish(
+            MarkerArray(markers=[delete, *self._visual_markers.values()])
+        )
+
     def _publish_all_visual(self):
         """Luôn gửi nguyên snapshot, không gửi từng quân rời rạc.
         Nhờ vậy QoS transient-local không chỉ cache quân cuối cùng."""
@@ -304,24 +358,7 @@ class PickPlaceNode(Node):
         từ 'world object' đứng yên trên bàn sang 'attached object' dính vào
         END_EFFECTOR, để nó trôi theo cánh tay trong suốt Lift->Move->Place.
         Trả về obj_id để hàm gọi truyền tiếp cho _detach_piece."""
-        # Khi đang chạy demo bỏ toàn bộ collision, không gửi request attach lên
-        # PlanningScene. Request này không đem lại giá trị collision nào nhưng
-        # có thể bị kẹt nếu MoveGroup đang đồng thời cập nhật scene. Visual sẽ
-        # được chuyển sang ô đích trong _detach_piece.
-        if SIMULATION_IGNORE_COLLISIONS:
-            return obj_id
-
         spec = PIECE_SPECS[piece_type]
-
-        aco = AttachedCollisionObject()
-        aco.link_name = END_EFFECTOR
-        aco.object.header.frame_id = END_EFFECTOR
-        aco.object.id = obj_id
-        aco.object.operation = CollisionObject.ADD
-
-        primitive = SolidPrimitive()
-        primitive.type = SolidPrimitive.CYLINDER
-        primitive.dimensions = [spec.pickup_height, 0.012]  # [height, radius]
         # Pose tương đối so với END_EFFECTOR lấy từ TF hiện tại. Nhờ vậy object
         # giữ đúng pose world lúc kẹp, kể cả TCP không song song trục Z của bàn.
         transform = self.tf_buffer.lookup_transform(
@@ -341,6 +378,21 @@ class PickPlaceNode(Node):
         pose.orientation.y = -q.y
         pose.orientation.z = -q.z
         pose.orientation.w = q.w
+        self._publish_carried_piece_visual(obj_id, pose)
+
+        # Demo vẫn có carry visual ở trên, chỉ bỏ attached collision để nhẹ.
+        if SIMULATION_IGNORE_COLLISIONS:
+            return obj_id
+
+        aco = AttachedCollisionObject()
+        aco.link_name = END_EFFECTOR
+        aco.object.header.frame_id = END_EFFECTOR
+        aco.object.id = obj_id
+        aco.object.operation = CollisionObject.ADD
+
+        primitive = SolidPrimitive()
+        primitive.type = SolidPrimitive.CYLINDER
+        primitive.dimensions = [spec.pickup_height, 0.012]  # [height, radius]
         aco.object.primitives = [primitive]
         aco.object.primitive_poses = [pose]
         aco.touch_links = GRIPPER_TOUCH_LINKS
@@ -364,31 +416,74 @@ class PickPlaceNode(Node):
         if old_type != piece_type:  # phong cấp: tốt thành hậu/xe/tượng/mã
             self.piece_info_by_id[obj_id] = (piece_type, is_white)
         self._publish_piece_visual(obj_id, world_xyz)
+        if self.carried_piece_id == obj_id:
+            self.carried_piece_id = None
         if to_square is not None:
             self.piece_id_by_square[to_square] = obj_id
 
     # ---------------- Move execution ----------------
 
+    def _fail(self, uci: str, reason: str):
+        """Gửi NACK để brain dừng chờ ACK và dừng game một cách tường minh."""
+        msg = String()
+        msg.data = f"{uci}: {reason}"
+        self.fail_pub.publish(msg)
+        self.get_logger().error(f"[FAIL] {uci}: {reason} (đã gửi NACK)")
+
     def on_move(self, msg: String):
-        payload = json.loads(msg.data)
+        try:
+            payload = json.loads(msg.data)
+            uci = payload.get("uci", "?")
+        except Exception as exc:
+            self.get_logger().error(f"[FAIL] payload /chess/move không parse được: {exc}")
+            return
+        with self._exec_lock:
+            if self._executing:
+                self.get_logger().error(
+                    f"[FAIL] move chồng {uci}: lượt trước chưa xong, từ chối để tránh race")
+                self._fail(uci, "overlapped with previous move")
+                return
+            self._executing = True
         # chạy trên thread riêng để không block callback ROS trong lúc chờ MoveIt2 thực thi
-        threading.Thread(target=self._execute_move, args=(payload,), daemon=True).start()
+        threading.Thread(target=self._execute_move_guarded, args=(payload,), daemon=True).start()
+
+    def _execute_move_guarded(self, payload: dict):
+        try:
+            self._execute_move(payload)
+        finally:
+            with self._exec_lock:
+                self._executing = False
 
     def _execute_move(self, payload: dict):
         uci = payload["uci"]
         from_sq, to_sq = uci[:2], uci[2:4]
         move = chess.Move.from_uci(uci)
         if move not in self.board.legal_moves:
-            self.get_logger().error(f"Từ chối nước đi không hợp lệ theo python-chess: {uci}")
+            self._fail(uci, "nước đi không hợp lệ theo python-chess")
             return
         moving_piece = self.board.piece_at(move.from_square)
         piece_type = moving_piece.symbol().lower()
+        expected_execution = "robot" if moving_piece.color == chess.WHITE else "virtual"
+        execution = payload.get("execution", expected_execution)
+        if execution != expected_execution:
+            self._fail(uci, f"execution sai: nhận {execution}, phải là {expected_execution}")
+            return
 
         try:
+            if execution == "virtual":
+                self._do_virtual_move(move, piece_type, payload)
+                self.board.push(move)
+                self.get_logger().info(f"[OK] virtual done {uci}")
+                done = String()
+                done.data = uci
+                self.done_pub.publish(done)
+                return
+
             # `move_group` của Dofbot nạp các planning pipeline khá chậm (thường
             # sau khi RViz đã mở).  Không được đánh rơi nước đầu tiên chỉ vì
             # service chưa xuất hiện ở thời điểm brain vừa publish nó.
             self._wait_for_motion_planner()
+            self._move_to_home("HOME trước lượt Trắng")
             if self.board.is_capture(move):
                 # Với en passant, quân bị ăn không ở ô đích mà ở cùng rank với ô đi.
                 captured_square = (
@@ -407,15 +502,54 @@ class PickPlaceNode(Node):
                 final_piece_type = payload.get("promotion") or piece_type
                 self._do_pick_place(from_sq, to_sq, piece_type, final_piece_type)
 
+            self._move_to_home("HOME sau lượt Trắng")
+
             # cập nhật board nội bộ SAU KHI đã dùng vị trí cũ để tính toán ở trên
             self.board.push(chess.Move.from_uci(uci))
         except Exception as exc:
-            self.get_logger().error(f"Không thực thi {uci}: {exc}")
+            self._fail(uci, f"không thực thi: {exc}")
             return
         else:
+            self.get_logger().info(f"[OK] done {uci}")
             done = String()
             done.data = uci
             self.done_pub.publish(done)
+
+    def _remove_virtual_piece(self, square: str):
+        """Bỏ quân bị ăn khỏi scene/visual trong lượt Đen tự đi."""
+        obj_id = self.piece_id_by_square.pop(square)
+        if not SIMULATION_IGNORE_COLLISIONS:
+            self.moveit2.remove_collision_object(id=obj_id)
+        self._delete_piece_visual(obj_id)
+
+    def _move_virtual_piece(self, from_sq: str, to_sq: str, piece_type: str):
+        obj_id = self.piece_id_by_square.pop(from_sq)
+        if not SIMULATION_IGNORE_COLLISIONS:
+            self.moveit2.remove_collision_object(id=obj_id)
+        old_type, is_white = self.piece_info_by_id[obj_id]
+        if old_type != piece_type:
+            self.piece_info_by_id[obj_id] = (piece_type, is_white)
+        target_xyz = (*square_to_xy(to_sq), BOARD_Z)
+        self._add_piece_collision_at(obj_id, target_xyz, piece_type)
+        self.piece_id_by_square[to_sq] = obj_id
+        self._publish_piece_visual(obj_id, target_xyz)
+
+    def _do_virtual_move(self, move: chess.Move, piece_type: str, payload: dict):
+        """Cập nhật atomically scene + visual cho nước Đen, không chạy arm."""
+        from_sq = chess.square_name(move.from_square)
+        to_sq = chess.square_name(move.to_square)
+        if self.board.is_capture(move):
+            captured_sq = (
+                to_sq[0] + from_sq[1]
+                if self.board.is_en_passant(move) else to_sq
+            )
+            self._remove_virtual_piece(captured_sq)
+
+        final_piece_type = payload.get("promotion") or piece_type
+        self._move_virtual_piece(from_sq, to_sq, final_piece_type)
+        if self.board.is_castling(move):
+            rook_from, rook_to = self._castling_rook_squares(move.uci())
+            self._move_virtual_piece(rook_from, rook_to, "r")
 
     def _wait_for_motion_planner(self, timeout_sec: float = 180.0):
         """Chờ đúng service mà pymoveit2 dùng để lập kế hoạch.
@@ -437,19 +571,174 @@ class PickPlaceNode(Node):
         if announced:
             self.get_logger().info("MoveIt planner đã sẵn sàng; tiếp tục nước cờ đang chờ.")
 
-    def _check_reachability(self, _request, response):
-        """Kiểm tra IK không thực thi cho cả 64 ô ở pre-grasp và PICK_TCP_Z.
+    # Ô đại diện cho deep-check: góc bàn, mép gần đế (c1/d1/e1/f1 có
+    # approach offset riêng), hàng tốt, trung tâm. Full-chain trên toàn bộ
+    # 64 ô quá lâu (mỗi ô 6 đoạn), subset này phủ mọi vùng hình học đặc biệt.
+    DEEP_CHECK_SQUARES = (
+        "a1", "c1", "d1", "e1", "f1", "h1", "b2", "g7",
+        "d4", "e4", "a8", "h8",
+    )
+    # Quét plan-only (nhanh) toàn bộ 16 slot nghĩa địa — bản cũ chỉ check 64 ô
+    # cờ nên slot discard thứ 6 mới lòi lỗi khi game đang chạy. Chỉ execute
+    # 3 slot đầu/giữa/cuối để giữ thời gian check hợp lý.
+    DEEP_CHECK_DISCARD_SLOTS = tuple(range(DISCARD_MAX_SLOTS))
+    DEEP_CHECK_DISCARD_EXEC_SLOTS = (0, 7, DISCARD_MAX_SLOTS - 1)
 
-        Đây là công cụ calibration: service chỉ tạo plan nên robot/FakeSystem
-        không chuyển động. Không tự ý đổi BOARD_ORIGIN vì vị trí bàn thật là
-        quyết định vật lý của người vận hành.
+    def _dry_segment(self, failures: dict, key: str, label: str, fn) -> bool:
+        """Chạy 1 đoạn của dry-run, ghi nhận lỗi theo phase thay vì raise."""
+        try:
+            fn()
+            return True
+        except Exception as exc:
+            failures.setdefault(key, []).append(label)
+            self.get_logger().error(f"[FAIL] dry-run {label}: {exc}")
+            return False
+
+    def _dry_run_square(
+        self,
+        square: str,
+        piece_type: str,
+        target_square: str,
+        failures: dict,
+        execute: bool,
+    ):
+        """Mô phỏng đúng chuỗi runtime của 1 nước đi, không kẹp/attach quân.
+
+        Chuỗi mirror _do_pick_place: approach -> hạ Cartesian -> nâng ->
+        chuyển sang approach ô đích -> hạ đặt -> nâng. Ở sim (FakeSystem)
+        thì EXECUTE thật để state/quaternion chaining đúng như runtime; ở
+        robot thật chỉ plan-only (an toàn, nhưng không kiểm tra chaining).
+        """
+        x0, y0, z0 = square_to_grasp_pose(square, piece_type)
+        src_approach = approach_tcp_z(square, z0)
+        tx, ty, tz = square_to_grasp_pose(target_square, piece_type)
+        tgt_approach = approach_tcp_z(target_square, tz)
+        obj_id = self.piece_id_by_square.get(square)
+        if obj_id and not SIMULATION_IGNORE_COLLISIONS:
+            self.moveit2.remove_collision_object(id=obj_id)
+            time.sleep(0.15)
+        try:
+            if execute:
+                # Mirror runtime: mọi lượt Trắng đều bắt đầu từ HOME (joint PTP).
+                # Không có bước này, dry-run chain ô này sang ô khác với start
+                # state mà runtime bao giờ không gặp -> fail giả.
+                ok = self._dry_segment(
+                    failures, "home", f"{square}/home",
+                    lambda: self._move_to_home(f"dry HOME trước {square}"))
+                if not ok:
+                    return
+                ok = self._dry_segment(
+                    failures, "approach", f"{square}/approach",
+                    lambda: self._move_to(x0, y0, src_approach))
+                if not ok:
+                    return
+                grasp_q = self._current_tcp_quat()
+                if not self._dry_segment(
+                    failures, "descend_pick", f"{square}/descend",
+                    lambda: self._move_vertical(x0, y0, z0, f"dry hạ gắp {square}", quat_xyzw=grasp_q)):
+                    return
+                if not self._dry_segment(
+                    failures, "lift_pick", f"{square}/lift",
+                    lambda: self._move_vertical(x0, y0, src_approach, f"dry nâng {square}", quat_xyzw=grasp_q)):
+                    return
+                if not self._dry_segment(
+                    failures, "transfer", f"{square}->{target_square}",
+                    lambda: self._move_to(tx, ty, tgt_approach)):
+                    return
+                place_q = self._current_tcp_quat()
+                if not self._dry_segment(
+                    failures, "descend_place", f"{target_square}/descend",
+                    lambda: self._move_vertical(tx, ty, tz, f"dry hạ đặt {target_square}", quat_xyzw=place_q)):
+                    return
+                self._dry_segment(
+                    failures, "lift_place", f"{target_square}/lift",
+                    lambda: self._move_vertical(tx, ty, tgt_approach, f"dry nâng {target_square}", quat_xyzw=place_q))
+            else:
+                grasp_q = self._current_tcp_quat()
+                self._dry_segment(
+                    failures, "approach", f"{square}/approach",
+                    lambda: self._plan_motion(
+                        position=[x0, y0, src_approach],
+                        target_link=END_EFFECTOR, tolerance_position=0.004))
+                self._dry_segment(
+                    failures, "descend_pick", f"{square}/descend",
+                    lambda: self._plan_motion(
+                        position=[x0, y0, z0], quat_xyzw=grasp_q,
+                        target_link=END_EFFECTOR, tolerance_position=0.002,
+                        tolerance_orientation=0.03, cartesian=True,
+                        max_step=0.002, cartesian_fraction_threshold=0.999))
+                self._dry_segment(
+                    failures, "transfer", f"{square}->{target_square}",
+                    lambda: self._plan_motion(
+                        position=[tx, ty, tgt_approach],
+                        target_link=END_EFFECTOR, tolerance_position=0.004))
+                self._dry_segment(
+                    failures, "descend_place", f"{target_square}/descend",
+                    lambda: self._plan_motion(
+                        position=[tx, ty, tz], quat_xyzw=grasp_q,
+                        target_link=END_EFFECTOR, tolerance_position=0.002,
+                        tolerance_orientation=0.03, cartesian=True,
+                        max_step=0.002, cartesian_fraction_threshold=0.999))
+        finally:
+            if obj_id and not SIMULATION_IGNORE_COLLISIONS:
+                self._restore_piece_collision(
+                    square, obj_id,
+                    self.piece_info_by_id[obj_id][0] if obj_id in self.piece_info_by_id else piece_type)
+
+    def _dry_run_discard_slot(self, slot: int, failures: dict, execute: bool):
+        """Mirror _do_discard: tới khu nghĩa địa + hạ/thả thẳng đứng."""
+        xd, yd, _zd = discard_slot_pose(slot)
+        dz = DISCARD_TCP_Z
+        try:
+            if execute:
+                if not self._dry_segment(
+                    failures, "discard", f"slot{slot}/transfer",
+                    lambda: self._move_to(xd, yd, dz + APPROACH_HEIGHT)):
+                    return
+                drop_q = self._current_tcp_quat()
+                if not self._dry_segment(
+                    failures, "discard", f"slot{slot}/descend",
+                    lambda: self._move_vertical(xd, yd, dz, f"dry hạ thả slot{slot}", quat_xyzw=drop_q)):
+                    return
+                self._dry_segment(
+                    failures, "discard", f"slot{slot}/lift",
+                    lambda: self._move_vertical(xd, yd, dz + APPROACH_HEIGHT, f"dry nâng slot{slot}", quat_xyzw=drop_q))
+            else:
+                q = self._current_tcp_quat()
+                self._dry_segment(
+                    failures, "discard", f"slot{slot}/transfer",
+                    lambda: self._plan_motion(
+                        position=[xd, yd, dz + APPROACH_HEIGHT],
+                        target_link=END_EFFECTOR, tolerance_position=0.004))
+                self._dry_segment(
+                    failures, "discard", f"slot{slot}/descend",
+                    lambda: self._plan_motion(
+                        position=[xd, yd, dz], quat_xyzw=q,
+                        target_link=END_EFFECTOR, tolerance_position=0.002,
+                        tolerance_orientation=0.03, cartesian=True,
+                        max_step=0.002, cartesian_fraction_threshold=0.999))
+        except Exception as exc:
+            failures.setdefault("discard", []).append(f"slot{slot}: {exc}")
+
+    def _check_reachability(self, _request, response):
+        """Kiểm tra khả năng gắp thật theo 2 tầng.
+
+        Tầng 1 (nhanh): position-only tới approach + pick của cả 64 ô từ
+        state hiện tại — tín hiệu hồi quy nhanh, KHÔNG chứng minh pick được.
+        Tầng 2 (deep): dry-run đúng chuỗi runtime (approach -> hạ/nâng
+        Cartesian giữ quaternion đã chốt -> chuyển ô -> hạ/đặt) trên
+        DEEP_CHECK_SQUARES + khu discard. Ở sim thì execute thật trên
+        FakeSystem; ở robot thật chỉ plan-only. response.success=False nếu
+        BẤT KỲ phase nào có lỗi (trước đây luôn True).
         """
         try:
             self._wait_for_motion_planner(timeout_sec=20.0)
             failures = {"approach": [], "pick": []}
             for square in chess.SQUARES:
                 name = chess.square_name(square)
-                x, y, pick_z = square_to_grasp_pose(name, "p")
+                piece = self.board.piece_at(square)
+                x, y, pick_z = square_to_grasp_pose(
+                    name, piece.symbol().lower() if piece else "p")
                 # Pipeline gắp thật bỏ collision của CHÍNH quân mục tiêu trước
                 # khi plan pre-grasp. Nếu để quân đó trong scene, vua/hậu ở d1/e1
                 # làm goal bị coi là va chạm và cho ra false negative.
@@ -473,15 +762,53 @@ class PickPlaceNode(Node):
                         self._restore_piece_collision(name, obj_id, piece_type)
 
             for phase, squares in failures.items():
-                self.get_logger().info(
-                    f"Reachability {phase}: {64 - len(squares)}/64; "
-                    f"không có IK: {', '.join(squares) if squares else 'không có'}"
+                if squares:
+                    self.get_logger().error(
+                        f"[FAIL] reach nhanh {phase}: {64 - len(squares)}/64, "
+                        f"không có plan: {', '.join(squares)}"
+                    )
+            if not failures["approach"] and not failures["pick"]:
+                self.get_logger().info("[OK] reach nhanh: 64/64 approach, 64/64 pick")
+
+            execute = SIMULATION_IGNORE_COLLISIONS
+            self.get_logger().info(
+                f"Deep-check chuỗi runtime trên {len(self.DEEP_CHECK_SQUARES)} ô "
+                f"({'EXECUTE trên FakeSystem' if execute else 'plan-only, robot thật không di chuyển'})..."
+            )
+            deep: dict = {}
+            for square in self.DEEP_CHECK_SQUARES:
+                piece = self.board.piece_at(chess.parse_square(square))
+                piece_type = piece.symbol().lower() if piece else "p"
+                target = "e4" if square != "e4" else "d5"
+                self._dry_run_square(square, piece_type, target, deep, execute)
+            for slot in self.DEEP_CHECK_DISCARD_SLOTS:
+                self._dry_run_discard_slot(
+                    slot, deep,
+                    execute and slot in self.DEEP_CHECK_DISCARD_EXEC_SLOTS)
+
+            deep_total = sum(len(v) for v in deep.values())
+            for phase, items in deep.items():
+                if items:
+                    self.get_logger().error(
+                        f"[FAIL] deep-check {phase}: {len(items)} lỗi: "
+                        f"{', '.join(items[:12])}"
+                    )
+            fast_fail = sum(len(v) for v in failures.values())
+            if fast_fail == 0 and deep_total == 0:
+                response.success = True
+                self.get_logger().info("[OK] reachability PASS toàn bộ")
+            else:
+                response.success = False
+                self.get_logger().error(
+                    "[FAIL] reachability CÓ LỖI — xem các dòng [FAIL] trên để biết ô/phase"
                 )
-            response.success = True
             response.message = (
-                f"approach {64-len(failures['approach'])}/64, "
-                f"pick {64-len(failures['pick'])}/64. "
-                "Xem terminal để biết danh sách ô không có IK."
+                f"nhanh approach {64-len(failures['approach'])}/64, "
+                f"pick {64-len(failures['pick'])}/64; "
+                f"deep-check lỗi {deep_total} "
+                f"({'EXECUTE' if execute else 'plan-only'}). "
+                + ("PASS toàn bộ." if response.success
+                   else "CÓ LỖI — xem terminal để biết ô/phase.")
             )
         except Exception as exc:
             response.success = False
@@ -509,27 +836,32 @@ class PickPlaceNode(Node):
             self._set_gripper(gripper_open)
             obj_id = self._take_piece_from_world(from_sq)
             self._move_to(x0, y0, source_approach_z)
-            self._move_vertical(x0, y0, z0, "hạ gắp")
+            # Chốt orientation NGAY sau approach: mọi đoạn vertical của lượt
+            # gắp giữ cùng 1 quaternion. Không để mỗi _move_vertical tự đọc
+            # TF (OMPL có thể đã chọn orientation khác ở lần plan trước).
+            grasp_q = self._current_tcp_quat()
+            self._move_vertical(x0, y0, z0, "hạ gắp", quat_xyzw=grasp_q)
             self._set_gripper(0.0)
             self._attach_piece(obj_id, piece_type, (x0, y0, z0))
             attached = True
-            self._move_vertical(x0, y0, source_approach_z, "nâng sau gắp")
+            self._move_vertical(x0, y0, source_approach_z, "nâng sau gắp", quat_xyzw=grasp_q)
 
             self._move_to(x1, y1, target_approach_z)
-            self._move_vertical(x1, y1, z1, "hạ đặt")
+            place_q = self._current_tcp_quat()
+            self._move_vertical(x1, y1, z1, "hạ đặt", quat_xyzw=place_q)
             self._set_gripper(gripper_open)
             self._detach_piece(
                 obj_id, to_sq, (x1, y1, BOARD_Z), placed_piece_type or piece_type
             )
             attached = False
-            self._move_vertical(x1, y1, target_approach_z, "nâng sau đặt")
+            self._move_vertical(x1, y1, target_approach_z, "nâng sau đặt", quat_xyzw=place_q)
         except Exception:
             if obj_id is not None and not attached:
                 # Failure trước attach: collision và mapping quay về nguyên trạng.
                 self._restore_piece_to_world(from_sq, obj_id, piece_type)
             elif attached:
                 self.get_logger().error(
-                    "Quân đang attached vào gripper sau lỗi; không gửi ACK. "
+                    "[FAIL] quân đang attached vào gripper sau lỗi; không gửi ACK. "
                     "Hãy mở gripper/đưa arm về safe pose rồi chạy lại nước này."
                 )
             raise
@@ -550,24 +882,26 @@ class PickPlaceNode(Node):
             self._set_gripper(PIECE_SPECS[piece_type].gripper_open)
             obj_id = self._take_piece_from_world(square)
             self._move_to(x0, y0, source_approach_z)
-            self._move_vertical(x0, y0, z0, "hạ gắp quân bị ăn")
+            grasp_q = self._current_tcp_quat()
+            self._move_vertical(x0, y0, z0, "hạ gắp quân bị ăn", quat_xyzw=grasp_q)
             self._set_gripper(0.0)
             self._attach_piece(obj_id, piece_type, (x0, y0, z0))
             attached = True
-            self._move_vertical(x0, y0, source_approach_z, "nâng quân bị ăn")
+            self._move_vertical(x0, y0, source_approach_z, "nâng quân bị ăn", quat_xyzw=grasp_q)
             # Move position-only tới khu discard để có thể vừa rời c1--f1 vừa
             # đổi cao độ; nâng thẳng tới 0.125 m ngay tại mép gần là vô nghiệm.
             self._move_to(xd, yd, discard_tcp_z + APPROACH_HEIGHT)
-            self._move_vertical(xd, yd, discard_tcp_z, "hạ thả quân bị ăn")
+            drop_q = self._current_tcp_quat()
+            self._move_vertical(xd, yd, discard_tcp_z, "hạ thả quân bị ăn", quat_xyzw=drop_q)
             self._set_gripper(PIECE_SPECS[piece_type].gripper_open)
             self._detach_piece(obj_id, None, (xd, yd, zd), piece_type)
             attached = False
-            self._move_vertical(xd, yd, discard_tcp_z + APPROACH_HEIGHT, "nâng sau thả quân bị ăn")
+            self._move_vertical(xd, yd, discard_tcp_z + APPROACH_HEIGHT, "nâng sau thả quân bị ăn", quat_xyzw=drop_q)
         except Exception:
             if obj_id is not None and not attached:
                 self._restore_piece_to_world(square, obj_id, piece_type)
             elif attached:
-                self.get_logger().error("Quân bị ăn vẫn attached sau lỗi; không gửi ACK.")
+                self.get_logger().error("[FAIL] quân bị ăn vẫn attached sau lỗi; không gửi ACK.")
             raise
 
     def _castling_rook_squares(self, uci: str):
@@ -649,24 +983,48 @@ class PickPlaceNode(Node):
             raise RuntimeError(f"Không tìm được position-only plan tới {(x, y, z)}")
         self._execute_and_wait(self.moveit2, trajectory)
 
-    def _move_vertical(self, x, y, z, step_name: str):
-        """Đi thẳng đứng bằng compute_cartesian_path, không để OMPL lách qua
-        bàn/quân trong đoạn hạ hoặc nâng.
+    def _move_to_home(self, label: str):
+        """Joint PTP về SRDF pose `arm_group/up` trước/sau lượt robot."""
+        trajectory = self._plan_motion(
+            joint_positions=HOME_JOINTS,
+            joint_names=JOINT_NAMES,
+            tolerance_joint_position=0.03,
+            cartesian=False,
+        )
+        if trajectory is None:
+            raise RuntimeError(f"Không tìm được joint PTP: {label}")
+        self._execute_and_wait(self.moveit2, trajectory)
 
-        Giữ quaternion TCP hiện tại để phù hợp arm 5DOF position-only. Nếu
-        Cartesian path không hoàn thành 100%, dừng trước khi gripper chạm bàn.
-        """
+    def _current_tcp_quat(self) -> list[float]:
+        """Đọc quaternion TCP hiện tại (BASE_LINK -> END_EFFECTOR).
+
+        Runtime chốt 1 quaternion duy nhất sau approach rồi truyền cho mọi
+        đoạn vertical của nước đi, thay vì để mỗi _move_vertical đọc lại
+        (OMPL position-only có thể trả orientation khác nhau mỗi lần gọi,
+        khiến Cartesian giữ orientation mới mà 5-DOF không làm được)."""
         try:
             transform = self.tf_buffer.lookup_transform(
                 BASE_LINK, END_EFFECTOR, rclpy.time.Time()
             )
         except Exception as exc:
             raise RuntimeError(f"Không đọc được TF {BASE_LINK}->{END_EFFECTOR}: {exc}")
-
         q = transform.transform.rotation
+        return [q.x, q.y, q.z, q.w]
+
+    def _move_vertical(self, x, y, z, step_name: str, quat_xyzw=None):
+        """Đi thẳng đứng bằng compute_cartesian_path, không để OMPL lách qua
+        bàn/quân trong đoạn hạ hoặc nâng.
+
+        quat_xyzw: orientation giữ suốt đoạn đi. Nên truyền quaternion đã chốt
+        sau approach (xem _current_tcp_quat); None = đọc TF hiện tại (giữ hành
+        vi cũ cho caller đơn lẻ). Nếu Cartesian path không hoàn thành 100%,
+        raise rõ ràng thay vì fallback âm thầm (trừ khi
+        ALLOW_CARTESIAN_FALLBACK=True được bật tường minh cho demo).
+        """
+        q = quat_xyzw if quat_xyzw is not None else self._current_tcp_quat()
         trajectory = self._plan_motion(
             position=[x, y, z],
-            quat_xyzw=[q.x, q.y, q.z, q.w],
+            quat_xyzw=q,
             target_link=END_EFFECTOR,
             tolerance_position=0.002,
             tolerance_orientation=0.03,
@@ -675,17 +1033,22 @@ class PickPlaceNode(Node):
             cartesian_fraction_threshold=0.999,
         )
         if trajectory is None:
-            if SIMULATION_IGNORE_COLLISIONS:
-                # Dofbot 5-DOF có thể có endpoint XYZ hợp lệ nhưng không giữ
-                # được cùng quaternion suốt một đường thẳng đứng, nhất là ở
-                # mép gần bàn. Demo hiện đã bỏ collision nên cho phép planner
-                # position-only chọn orientation trung gian để hoàn tất ván.
+            if SIMULATION_IGNORE_COLLISIONS and ALLOW_CARTESIAN_FALLBACK:
+                # Opt-in tường minh cho demo: cho phép planner position-only
+                # chọn orientation trung gian để hoàn tất ván. Pick lúc này
+                # KHÔNG đi thẳng đứng thật — chỉ dùng để demo flow, không
+                # dùng với robot thật.
                 self.get_logger().warning(
                     f"Cartesian không đủ tại {step_name}; dùng position-only fallback tới {(x, y, z)}"
                 )
                 self._move_to(x, y, z)
                 return
-            raise RuntimeError(f"Không có Cartesian path an toàn khi {step_name} tới {(x, y, z)}")
+            raise RuntimeError(
+                f"Không có Cartesian path an toàn khi {step_name} tới {(x, y, z)} "
+                f"(quat giữ {[round(v, 3) for v in q]}). "
+                f"Hãy chạy /chess/check_reachability để xem ô/phase lỗi, "
+                f"kiểm tra approach offset và orientation sau approach."
+            )
         self._execute_and_wait(self.moveit2, trajectory)
 
     def _set_gripper(self, opening: float):

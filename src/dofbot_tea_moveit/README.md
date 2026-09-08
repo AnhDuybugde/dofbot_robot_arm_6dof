@@ -54,9 +54,18 @@ source ~/dofbot_tea_chess/install/setup.bash
 ros2 launch dofbot_tea_moveit tea_backend.launch.py
 # terminal 2: task rót trà
 ros2 launch dofbot_tea_moveit tea_task.launch.py
-# terminal 3 (optional): RViz
+# terminal 3 (optional): RViz lite (mặc định, phù hợp máy yếu)
 ros2 launch dofbot_tea_moveit tea_rviz.launch.py
 ```
+
+Toàn bộ launch Tea dùng `dofbot_lite`: 14 box primitive thay cho visual mesh
+STL high-poly; link/joint, collision proxy và MoveIt kinematics không đổi.
+
+`tea_rviz.launch.py` mở `config/tea_view_lite.rviz`: chỉ hiển thị robot và
+proxy primitive nhẹ cho ly/ấm, không render STL gốc gần 500k triangles. Scene
+chỉ publish khi task thay đổi trạng thái, nên không có redraw định kỳ lúc idle.
+Khi cần debug quỹ đạo, bật display `MotionPlanning (enable for trajectory)`
+trong profile lite; nó tắt mặc định để giữ FPS.
 
 Điều khiển task qua service (terminal đã source):
 

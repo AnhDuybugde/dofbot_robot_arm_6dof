@@ -13,7 +13,7 @@ setup(
             "launch/chess_sim.launch.py", "launch/chess_base.launch.py"
         ]),
         ("share/" + package_name + "/config", [
-            "config/chess.rviz", "config/chess_base.rviz"
+            "config/chess.rviz", "config/chess_lite.rviz", "config/chess_base.rviz"
         ]),
     ],
     # python-chess được cài ở môi trường Python; pymoveit2 là ROS package trong workspace.

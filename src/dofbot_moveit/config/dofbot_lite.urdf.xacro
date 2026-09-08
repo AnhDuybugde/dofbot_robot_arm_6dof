@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<!-- Same kinematics and collision geometry as dofbot.urdf.xacro; low-poly visual. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="dofbot">
+  <xacro:arg name="initial_positions_file" default="initial_positions.yaml"/>
+  <xacro:include filename="dofbot_lite_model.urdf.xacro"/>
+  <xacro:include filename="dofbot.ros2_control.xacro"/>
+  <xacro:dofbot_ros2_control name="FakeSystem" initial_positions_file="$(arg initial_positions_file)"/>
+</robot>

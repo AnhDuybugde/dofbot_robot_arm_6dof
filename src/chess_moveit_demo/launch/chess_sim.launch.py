@@ -21,9 +21,11 @@ def generate_launch_description():
         launch_arguments={"use_rviz": "false"}.items(),
     )
 
-    moveit_config = MoveItConfigsBuilder(
-        "dofbot", package_name="dofbot_moveit"
-    ).to_moveit_configs()
+    moveit_config = (
+        MoveItConfigsBuilder("dofbot", package_name="dofbot_moveit")
+        .robot_description(file_path="config/dofbot.urdf.xacro")
+        .to_moveit_configs()
+    )
     chess_rviz = Node(
         package="rviz2",
         executable="rviz2",
@@ -31,11 +33,15 @@ def generate_launch_description():
         arguments=[
             "-d",
             PathJoinSubstitution(
-                [FindPackageShare("chess_moveit_demo"), "config", "chess.rviz"]
+                [FindPackageShare("chess_moveit_demo"), "config", "chess_lite.rviz"]
             ),
         ],
         parameters=[moveit_config.to_dict()],
-        output="screen",
+        # RViz Qt/plugin spam log rất dài trên terminal launch nhưng hiếm khi
+        # chứa lỗi liên quan game: đẩy ra log file, giữ terminal cho log
+        # chess brain/pick-place ([OK]/[FAIL]).
+        output="log",
+        ros_arguments=["--log-level", "WARN"],
     )
 
     chess_brain = Node(

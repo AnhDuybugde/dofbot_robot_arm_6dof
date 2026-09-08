@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<!--
+  Dofbot render model for low-power RViz clients (kept in dofbot_moveit so it
+  remains versioned even when dofbot_urdf meshes are gitignored).
+
+  Link names, joint axes, joint limits, mimic joints and collision dimensions
+  deliberately match dofbot.urdf.  Only the expensive STL <visual> meshes are
+  replaced by simple boxes/cylinders.  It is safe for MoveIt/FakeSystem: this
+  file changes appearance, not kinematics or collision checking.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="dofbot">
+  <xacro:macro name="lite_box_link" params="name xyz size rgba">
+    <link name="${name}">
+      <visual><origin xyz="${xyz}" rpy="0 0 0"/><geometry><box size="${size}"/></geometry><material name="${name}_lite"><color rgba="${rgba}"/></material></visual>
+      <collision><origin xyz="${xyz}" rpy="0 0 0"/><geometry><box size="${size}"/></geometry></collision>
+    </link>
+  </xacro:macro>
+  <xacro:macro name="lite_cylinder_link" params="name xyz radius length rgba">
+    <link name="${name}">
+      <visual><origin xyz="${xyz}" rpy="0 0 0"/><geometry><cylinder radius="${radius}" length="${length}"/></geometry><material name="${name}_lite"><color rgba="${rgba}"/></material></visual>
+      <collision><origin xyz="${xyz}" rpy="0 0 0"/><geometry><cylinder radius="${radius}" length="${length}"/></geometry></collision>
+    </link>
+  </xacro:macro>
+
+  <!-- Dimensions use the existing collision proxies, so visual and collision
+       remain easy to compare while rendering only 14 primitives. -->
+  <xacro:lite_box_link name="base_link" xyz="-0.0665 0.001 0.0445" size="0.25 0.12 0.115" rgba="0.18 0.18 0.20 1"/>
+  <xacro:lite_box_link name="arm1_Link" xyz="0 -0.002 0.016" size="0.06 0.055 0.06" rgba="1 0.83 0.03 1"/>
+  <xacro:lite_box_link name="arm2_Link" xyz="-0.004 0 0.04" size="0.035 0.05 0.11" rgba="0.59 0.67 0.68 1"/>
+  <xacro:lite_box_link name="arm3_Link" xyz="-0.004 0 0.04" size="0.035 0.05 0.11" rgba="0.92 0.92 0.92 1"/>
+  <xacro:lite_box_link name="arm4_Link" xyz="-0.017 0.001 0.032" size="0.10 0.04 0.095" rgba="0.92 0.92 0.92 1"/>
+  <xacro:lite_box_link name="arm5_Link" xyz="0.016 -0.003 0.024" size="0.055 0.06 0.055" rgba="0.22 0.22 0.22 1"/>
+  <xacro:lite_box_link name="Rlink1_Link" xyz="0.01 0.001 -0.005" size="0.05 0.025 0.02" rgba="0.22 0.22 0.22 1"/>
+  <xacro:lite_box_link name="Rlink2_Link" xyz="0.024 0.004 -0.005" size="0.06 0.02 0.01" rgba="0.22 0.22 0.22 1"/>
+  <xacro:lite_box_link name="Llink1_Link" xyz="0.01 -0.001 -0.0025" size="0.05 0.025 0.022" rgba="0.22 0.22 0.22 1"/>
+  <xacro:lite_box_link name="Llink2_Link" xyz="0.024 -0.004 -0.005" size="0.06 0.02 0.01" rgba="0.22 0.22 0.22 1"/>
+  <xacro:lite_box_link name="Rlink3_Link" xyz="0.015 0 -0.006" size="0.04 0.01 0.02" rgba="0.22 0.22 0.22 1"/>
+  <xacro:lite_box_link name="Llink3_Link" xyz="0.015 0 -0.006" size="0.04 0.01 0.02" rgba="0.92 0.92 0.92 1"/>
+  <xacro:lite_box_link name="Camera_Link" xyz="0 0 -0.015" size="0.03 0.035 0.035" rgba="0.53 0.53 0.53 1"/>
+  <xacro:lite_box_link name="Gripping_point_Link" xyz="-0.07 0 0" size="0.01 0.025 0.025" rgba="0.95 0.25 0.05 1"/>
+
+  <joint name="arm1_Joint" type="revolute"><origin xyz="0 0 0.0925" rpy="0 0 0"/><parent link="base_link"/><child link="arm1_Link"/><axis xyz="0 0 1"/><limit lower="-1.57" upper="1.57" effort="10" velocity="1000"/></joint>
+  <joint name="arm2_Joint" type="revolute"><origin xyz="0 0.00005 0.033" rpy="0 0 0"/><parent link="arm1_Link"/><child link="arm2_Link"/><axis xyz="0 1 0"/><limit lower="-1.57" upper="1.57" effort="10" velocity="1000"/></joint>
+  <joint name="arm3_Joint" type="revolute"><origin xyz="0 0.00055 0.08285" rpy="0 0 0"/><parent link="arm2_Link"/><child link="arm3_Link"/><axis xyz="0 1 0"/><limit lower="-1.57" upper="1.57" effort="10" velocity="1000"/></joint>
+  <joint name="arm4_Joint" type="revolute"><origin xyz="0 0.00005 0.08285" rpy="0 0 0"/><parent link="arm3_Link"/><child link="arm4_Link"/><axis xyz="0 1 0"/><limit lower="-1.57" upper="1.57" effort="10" velocity="1000"/></joint>
+  <joint name="arm5_Joint" type="revolute"><origin xyz="-0.00215 -0.000045 0.078149" rpy="0 0 0"/><parent link="arm4_Link"/><child link="arm5_Link"/><axis xyz="0 0 1"/><limit lower="-1.57" upper="1.57" effort="10" velocity="1000"/></joint>
+  <joint name="Rlink1_Joint" type="revolute"><origin xyz="-0.00575 -0.012625 0.029275" rpy="1.5708 0.011933 -1.5708"/><parent link="arm5_Link"/><child link="Rlink1_Link"/><axis xyz="0 0 1"/><limit lower="0" upper="1.57" effort="10" velocity="1000"/></joint>
+  <joint name="Rlink2_Joint" type="continuous"><origin xyz="0.03 0 0" rpy="0 0 1.5827"/><parent link="Rlink1_Link"/><child link="Rlink2_Link"/><axis xyz="0 0 1"/><mimic joint="Rlink1_Joint" multiplier="-1" offset="0"/></joint>
+  <joint name="Llink1_Joint" type="revolute"><origin xyz="-0.00575 0.012375 0.029275" rpy="-1.5708 0.012847 1.5708"/><parent link="arm5_Link"/><child link="Llink1_Link"/><axis xyz="0 0 1"/><limit lower="-1.57" upper="1.57" effort="10" velocity="1000"/><mimic joint="Rlink1_Joint" multiplier="-1" offset="0"/></joint>
+  <joint name="Llink2_Joint" type="continuous"><origin xyz="0.03 0 0" rpy="0 0 -1.5836"/><parent link="Llink1_Link"/><child link="Llink2_Link"/><axis xyz="0 0 1"/><mimic joint="Rlink1_Joint" multiplier="1" offset="0"/></joint>
+  <joint name="Rlink3_Joint" type="continuous"><origin xyz="-0.0055 -0.0045 0.047275" rpy="1.5708 0.0027284 -1.5708"/><parent link="arm5_Link"/><child link="Rlink3_Link"/><axis xyz="0 0 1"/><mimic joint="Rlink1_Joint" multiplier="1" offset="0"/></joint>
+  <joint name="Llink3_Joint" type="continuous"><origin xyz="-0.0055 0.0045 0.047275" rpy="-1.5708 0 1.5708"/><parent link="arm5_Link"/><child link="Llink3_Link"/><axis xyz="0 0 1"/><mimic joint="Rlink1_Joint" multiplier="-1" offset="0"/></joint>
+  <joint name="Camera_Joint" type="fixed"><origin xyz="-0.0481 -0.00005 0.0707" rpy="0 0 0"/><parent link="arm4_Link"/><child link="Camera_Link"/></joint>
+  <joint name="Gripping_Joint" type="fixed"><origin xyz="-0.00265 0.000097552 0.068091" rpy="3.1416 -1.5708 0"/><parent link="arm5_Link"/><child link="Gripping_point_Link"/></joint>
+</robot>

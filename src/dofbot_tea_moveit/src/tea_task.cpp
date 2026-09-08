@@ -468,13 +468,8 @@ public:
             visualization_msgs::msg::MarkerArray
         >("/tea_scene",scene_qos);
         publishVisualScene();
-        // FPS fix: visual scene is transient_local latched; 500ms re-publish of
-        // 2x high-poly mesh markers (Teapot 16MB + Cup 7MB) forced RViz mesh
-        // reload + redraw at 2Hz even when idle. 2s heartbeat is enough for
-        // late-joining RViz; moves call publishVisualScene() on demand.
-        scene_timer_=node_->create_wall_timer(
-            2000ms,[this](){ publishVisualScene(); }
-        );
+        // transient_local giữ snapshot đầu cho RViz mở muộn. Không publish
+        // heartbeat: scene chỉ được cập nhật sau một bước task thành công.
 
         service_group_=
             node_->create_callback_group(
@@ -550,6 +545,20 @@ private:
     {
         if(!scene_pub_) return;
         visualization_msgs::msg::MarkerArray a;
+        auto centerMeshPose=[](
+            const geometry_msgs::msg::Pose& pose,
+            const MeshData& mesh){
+            auto t=poseToTf(pose);
+            t*=tf2::Transform(
+                tf2::Quaternion::getIdentity(),
+                tf2::Vector3(
+                    (mesh.min_x+mesh.max_x)*0.5,
+                    (mesh.min_y+mesh.max_y)*0.5,
+                    (mesh.min_z+mesh.max_z)*0.5
+                )
+            );
+            return tfToPose(t);
+        };
         auto add=[&](int id,const std::string& ns,int type,
                      const std::string& frame,
                      const geometry_msgs::msg::Pose& pose,
@@ -569,14 +578,23 @@ private:
         add(1,"tea_table",visualization_msgs::msg::Marker::CUBE,
             "base_link",poseXYZYaw(table_x_,table_y_,table_z_,0),
             table_sx_,table_sy_,table_sz_);
-        add(10,"tea_cup",visualization_msgs::msg::Marker::MESH_RESOURCE,
-            "base_link",cup_pose_,cup_scale_,cup_scale_,cup_scale_,
-            "package://dofbot_urdf/meshes/objects/TeaCup.stl");
-        add(20,"tea_teapot",visualization_msgs::msg::Marker::MESH_RESOURCE,
+        // Visual proxy thay cho STL gốc (cup ~150k, pot ~327k triangles).
+        // Collision của MoveIt vẫn dùng mesh low-poly đã decimate ở loadGeometry().
+        const double cup_x=cup_mesh_.max_x-cup_mesh_.min_x;
+        const double cup_y=cup_mesh_.max_y-cup_mesh_.min_y;
+        add(10,"tea_cup",visualization_msgs::msg::Marker::CYLINDER,
+            "base_link",centerMeshPose(cup_pose_,cup_mesh_),
+            std::max(cup_x,cup_y),std::max(cup_x,cup_y),
+            cup_mesh_.max_z-cup_mesh_.min_z);
+        add(20,"tea_teapot",visualization_msgs::msg::Marker::CUBE,
             pot_attached_ ? TIP : "base_link",
-            pot_attached_ ? pot_relative_pose_ : pot_world_pose_,
-            pot_scale_,pot_scale_,pot_scale_,
-            "package://dofbot_urdf/meshes/objects/WaterSprayingTeapot.stl");
+            centerMeshPose(
+                pot_attached_ ? pot_relative_pose_ : pot_world_pose_,
+                pot_mesh_
+            ),
+            pot_mesh_.max_x-pot_mesh_.min_x,
+            pot_mesh_.max_y-pot_mesh_.min_y,
+            pot_mesh_.max_z-pot_mesh_.min_z);
         scene_pub_->publish(a);
     }
 
@@ -2305,6 +2323,7 @@ private:
         }
 
         step_++;
+        publishVisualScene();
 
         if(step_>=16){
             RCLCPP_INFO(
@@ -2396,7 +2415,6 @@ private:
             planning_scene_;
 
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr scene_pub_;
-    rclcpp::TimerBase::SharedPtr scene_timer_;
 
     rclcpp::CallbackGroup::SharedPtr
         service_group_;

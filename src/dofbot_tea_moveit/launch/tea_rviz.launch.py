@@ -10,14 +10,12 @@ def generate_launch_description():
     cfg=MoveItConfigsBuilder(
         "dofbot",
         package_name="dofbot_moveit"
+    ).robot_description(
+        file_path="config/dofbot.urdf.xacro"
     ).to_moveit_configs()
 
     tea_share=get_package_share_directory(
         "dofbot_tea_moveit"
-    )
-
-    moveit_share=get_package_share_directory(
-        "dofbot_moveit"
     )
 
     srdf_path=os.path.join(
@@ -27,9 +25,9 @@ def generate_launch_description():
     )
 
     rviz_config=os.path.join(
-        moveit_share,
+        tea_share,
         "config",
-        "moveit.rviz"
+        "tea_view_lite.rviz"
     )
 
     with open(
