@@ -571,13 +571,10 @@ class PickPlaceNode(Node):
         if announced:
             self.get_logger().info("MoveIt planner đã sẵn sàng; tiếp tục nước cờ đang chờ.")
 
-    # Ô đại diện cho deep-check: góc bàn, mép gần đế (c1/d1/e1/f1 có
-    # approach offset riêng), hàng tốt, trung tâm. Full-chain trên toàn bộ
-    # 64 ô quá lâu (mỗi ô 6 đoạn), subset này phủ mọi vùng hình học đặc biệt.
-    DEEP_CHECK_SQUARES = (
-        "a1", "c1", "d1", "e1", "f1", "h1", "b2", "g7",
-        "d4", "e4", "a8", "h8",
-    )
+    # Deep-check chỉ chạy trên ô có QUÂN TRẮNG (robot chỉ gắp Trắng; Đen đi
+    # virtual). Ưu tiên hàng cuối (gần đế, vùng IK khó) rồi tới quân đã tiến,
+    # tối đa DEEP_CHECK_MAX_SQUARES ô để thời gian check hợp lý.
+    DEEP_CHECK_MAX_SQUARES = 10
     # Quét plan-only (nhanh) toàn bộ 16 slot nghĩa địa — bản cũ chỉ check 64 ô
     # cờ nên slot discard thứ 6 mới lòi lỗi khi game đang chạy. Chỉ execute
     # 3 slot đầu/giữa/cuối để giữ thời gian check hợp lý.
@@ -721,24 +718,39 @@ class PickPlaceNode(Node):
             failures.setdefault("discard", []).append(f"slot{slot}: {exc}")
 
     def _check_reachability(self, _request, response):
-        """Kiểm tra khả năng gắp thật theo 2 tầng.
+        """Kiểm tra khả năng gắp thật theo 2 tầng, CHỈ cho quân TRẮNG.
 
-        Tầng 1 (nhanh): position-only tới approach + pick của cả 64 ô từ
-        state hiện tại — tín hiệu hồi quy nhanh, KHÔNG chứng minh pick được.
-        Tầng 2 (deep): dry-run đúng chuỗi runtime (approach -> hạ/nâng
-        Cartesian giữ quaternion đã chốt -> chuyển ô -> hạ/đặt) trên
-        DEEP_CHECK_SQUARES + khu discard. Ở sim thì execute thật trên
-        FakeSystem; ở robot thật chỉ plan-only. response.success=False nếu
-        BẤT KỲ phase nào có lỗi (trước đây luôn True).
+        Robot chỉ điều khiển Trắng (Đen đi virtual, không chạy arm), nên check
+        64 ô là thừa và gây nhiễu fail ở ô Đen không bao giờ gắp. Cả 2 tầng đều
+        suy từ board state hiện tại:
+        Tầng 1 (nhanh): position-only tới approach + pick của mọi ô đang có
+        quân Trắng — tín hiệu hồi quy nhanh, KHÔNG chứng minh pick được.
+        Tầng 2 (deep): dry-run đúng chuỗi runtime (HOME -> approach -> hạ/nâng
+        Cartesian giữ quaternion đã chốt -> chuyển ô -> hạ/đặt) trên tối đa
+        DEEP_CHECK_MAX_SQUARES ô trắng (hàng cuối trước) + toàn bộ khu discard
+        (robot vẫn phải mang quân Đen bị ăn ra nghĩa địa). Ở sim thì execute
+        thật trên FakeSystem; ở robot thật chỉ plan-only. response.success=False
+        nếu BẤT KỲ phase nào có lỗi.
         """
         try:
             self._wait_for_motion_planner(timeout_sec=20.0)
+            execute = SIMULATION_IGNORE_COLLISIONS
+            if execute:
+                # Quét nhanh phải xuất phát đúng start state như runtime (mọi
+                # lượt Trắng đều bắt đầu từ HOME). Nếu không, fail có thể chỉ
+                # do arm đang đứng ở pose xấu từ game trước — fail giả.
+                self._move_to_home("HOME trước quét reachability")
+            # Ô đang có quân Trắng trên board hiện tại.
+            white_names = [
+                chess.square_name(sq)
+                for sq in chess.SQUARES
+                if (p := self.board.piece_at(sq)) is not None and p.color
+            ]
+            n_white = len(white_names)
             failures = {"approach": [], "pick": []}
-            for square in chess.SQUARES:
-                name = chess.square_name(square)
-                piece = self.board.piece_at(square)
-                x, y, pick_z = square_to_grasp_pose(
-                    name, piece.symbol().lower() if piece else "p")
+            for name in white_names:
+                piece = self.board.piece_at(chess.parse_square(name))
+                x, y, pick_z = square_to_grasp_pose(name, piece.symbol().lower())
                 # Pipeline gắp thật bỏ collision của CHÍNH quân mục tiêu trước
                 # khi plan pre-grasp. Nếu để quân đó trong scene, vua/hậu ở d1/e1
                 # làm goal bị coi là va chạm và cho ra false negative.
@@ -764,19 +776,25 @@ class PickPlaceNode(Node):
             for phase, squares in failures.items():
                 if squares:
                     self.get_logger().error(
-                        f"[FAIL] reach nhanh {phase}: {64 - len(squares)}/64, "
+                        f"[FAIL] reach nhanh (Trắng) {phase}: "
+                        f"{n_white - len(squares)}/{n_white}, "
                         f"không có plan: {', '.join(squares)}"
                     )
             if not failures["approach"] and not failures["pick"]:
-                self.get_logger().info("[OK] reach nhanh: 64/64 approach, 64/64 pick")
+                self.get_logger().info(
+                    f"[OK] reach nhanh (Trắng): {n_white}/{n_white} approach, "
+                    f"{n_white}/{n_white} pick")
 
-            execute = SIMULATION_IGNORE_COLLISIONS
+            # Hàng cuối trước (vùng khó), rồi tới quân đã tiến xa.
+            back = sorted(s for s in white_names if s[1] == "1")
+            rest = sorted(s for s in white_names if s[1] != "1")
+            deep_squares = (back + rest)[:self.DEEP_CHECK_MAX_SQUARES]
             self.get_logger().info(
-                f"Deep-check chuỗi runtime trên {len(self.DEEP_CHECK_SQUARES)} ô "
+                f"Deep-check {len(deep_squares)} ô trắng {deep_squares} "
                 f"({'EXECUTE trên FakeSystem' if execute else 'plan-only, robot thật không di chuyển'})..."
             )
             deep: dict = {}
-            for square in self.DEEP_CHECK_SQUARES:
+            for square in deep_squares:
                 piece = self.board.piece_at(chess.parse_square(square))
                 piece_type = piece.symbol().lower() if piece else "p"
                 target = "e4" if square != "e4" else "d5"
@@ -803,9 +821,10 @@ class PickPlaceNode(Node):
                     "[FAIL] reachability CÓ LỖI — xem các dòng [FAIL] trên để biết ô/phase"
                 )
             response.message = (
-                f"nhanh approach {64-len(failures['approach'])}/64, "
-                f"pick {64-len(failures['pick'])}/64; "
-                f"deep-check lỗi {deep_total} "
+                f"trắng approach {n_white-len(failures['approach'])}/{n_white}, "
+                f"pick {n_white-len(failures['pick'])}/{n_white}; "
+                f"deep-check {len(deep_squares)} ô trắng + {len(self.DEEP_CHECK_DISCARD_SLOTS)} slot, "
+                f"lỗi {deep_total} "
                 f"({'EXECUTE' if execute else 'plan-only'}). "
                 + ("PASS toàn bộ." if response.success
                    else "CÓ LỖI — xem terminal để biết ô/phase.")

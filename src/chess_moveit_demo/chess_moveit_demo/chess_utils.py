@@ -10,7 +10,12 @@ from dataclasses import dataclass
 # ==== THAM SỐ CALIBRATION (chỉnh theo bàn cờ mô phỏng của bạn) ====
 # Bàn được tịnh tiến xa theo +X để các ô hàng 1--2 không chồng lên đế robot.
 # a1 = (0.095, -0.095); h8 = (0.284, 0.094); riêng e2 = (0.122, 0.013).
-# Z giữ nguyên. Khi dùng bàn thật, calibrate lại theo vị trí vật lý.
+# Đo IK sweep /compute_ik 09/2026 (26 pose pick+approach): ox=0.095 PASS 26/26;
+# mọi ox>=0.100 làm rớt pick góc xa a8/h8, ox>=0.110 rớt cả approach a8/h8.
+# Giữ 0.095 (tối ưu IK toàn bàn). Lỗi approach hàng 1 gặp ở runtime là tầng
+# OMPL planning (goal sampling/self-collision/start state), KHÔNG phải IK —
+# check_reachability đo đúng tầng đó nên mới thấy. Khi dùng bàn thật,
+# calibrate lại theo vị trí vật lý.
 BOARD_ORIGIN = (0.095, -0.095, 0.005)  # toạ độ tâm ô a1 so với base_link (m)
 SQUARE_SIZE = 0.027                     # cạnh ô (m)
 BOARD_Z = 0.005                         # cao độ mặt bàn cờ so với base_link (m)
