@@ -99,9 +99,15 @@ class ChessBaseNode(Node):
         try:
             payload = json.loads(msg.data)
             uci = payload["uci"]
+            command_id = int(payload["command_id"])
+            board_fen = payload["board_fen"]
             move = chess.Move.from_uci(uci)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.get_logger().error(f"Payload nước cờ không hợp lệ: {exc}")
+            return
+        if command_id <= 0 or board_fen != self.board.fen():
+            self.get_logger().error(
+                f"Từ chối command {command_id}: board_fen không khớp")
             return
         if move not in self.board.legal_moves:
             self.get_logger().error(f"Từ chối nước đi không hợp lệ theo python-chess: {uci}")
@@ -109,7 +115,7 @@ class ChessBaseNode(Node):
         self.board.push(move)
         self._publish_position()
         done = String()
-        done.data = uci
+        done.data = f"{command_id}:{uci}"
         self.done_pub.publish(done)
         self.get_logger().info(f"Đã mô phỏng nước {uci}; gửi ACK để Stockfish đi tiếp.")
 
@@ -124,4 +130,3 @@ def main():
     finally:
         node.destroy_node()
         rclpy.shutdown()
-

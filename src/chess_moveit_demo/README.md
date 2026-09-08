@@ -133,9 +133,26 @@ và khu discard):
 ros2 service call /chess/check_reachability std_srvs/srv/Trigger '{}'
 ```
 
-Ở sim (FakeSystem) tầng deep **có di chuyển arm thật** (execute dry-run không
-kẹp quân); ở robot thật chỉ plan-only. `success=False` nếu bất kỳ phase nào
-(approach/hạ/nâng Cartesian/chuyển ô/discard) lỗi — khác bản cũ luôn True.
+Ở sim (FakeSystem) tầng deep **có di chuyển arm thật, đóng/mở kẹp và
+attach/detach quân**; mỗi ca đặt tạm rồi trả quân về ô nguồn. Collision vẫn
+bật trong cả chuỗi này. Trước khi dùng arm thật, đổi
+`REACHABILITY_EXECUTE_ON_FAKESYSTEM=False`. `success=False` nếu bất kỳ phase
+(HOME/gắp/attach/lift/chuyển/thả/rút/discard) lỗi.
+
+Khi lỗi collision, terminal in block `REACHABILITY-FAIL-SUMMARY` để copy toàn
+bộ `scope | phase | case | reason`. Deep-check dừng ngay tại root failure;
+vì vậy các lỗi HOME/slot dây chuyền không bị trộn vào nguyên nhân đầu tiên.
+Checker cũng in `COLLISION-CONTACT` cho current state và HOME goal nếu MoveIt
+phát hiện cặp collision cụ thể.
+
+Approach gắp được chọn tự động bằng danh sách candidate hữu hạn: tâm ô trước,
+sau đó lệch 3, 6 và tối đa 8 mm theo các trục/đường chéo. Mỗi candidate chạy
+đúng pipeline OMPL tới pre-grasp rồi Cartesian xuống grasp với collision bật;
+dừng ngay ở candidate đầu tiên thành công và cache offset theo ô để lượt sau
+thử nó trước. Nếu toàn bộ candidate thất bại, lượt bị dừng an toàn. Đây không
+phải ngoại lệ collision: quân, visual và điểm đặt vẫn nằm đúng tâm ô; chỉ TCP
+lúc gắp được dịch trong ô nguồn. Cache chỉ đổi thứ tự thử, mọi lượt vẫn plan
+lại theo PlanningScene hiện tại.
 
 Terminal đang chạy launch sẽ in danh sách ô không có IK ở cả `approach` và
 `pick`. Bảng approach đã đo IK thực tế (KDL position-only): `c1`/`f1` dùng
@@ -152,10 +169,11 @@ khi hai ngón kẹp đúng thân quân mà TCP không chạm bàn.
 Có. Bản này dùng cơ chế **attach/detach collision object** đúng chuẩn MoveIt2
 (qua service `/apply_planning_scene`) thay vì chỉ xoá-thêm object ở vị trí mới:
 
-- Trước lúc hạ gắp, `_take_piece_from_world()` chỉ gỡ collision của **quân đang
-  gắp**. Vì vậy MoveIt không loại toàn bộ IK chỉ vì ngón phải chạm quân mục tiêu;
-  bàn và mọi quân khác vẫn là chướng ngại. Nếu Cartesian pick thất bại, object
-  này được thêm lại ngay tại ô nguồn.
+- Trước lúc hạ gắp, `_take_piece_from_world()` giữ quân trong PlanningScene và
+  chỉ mở ACM tạm thời giữa quân đó với các link ngón kẹp và mặt bàn. Vì vậy arm,
+  đế và các quân khác vẫn là chướng ngại thật. Sau khi rút kẹp, contact tạm
+  được giữ tới khi arm về HOME (tránh start-state chạm ngón giả), rồi ACM mới
+  được đóng lại.
 - Lúc gripper vừa đóng, `_attach_piece()` gắn object vào `END_EFFECTOR` với
   offset lấy từ TF của TCP, đồng thời khai báo các link ngón là `touch_links`.
   Trong suốt Lift → Move, marker visual cũng đổi sang frame

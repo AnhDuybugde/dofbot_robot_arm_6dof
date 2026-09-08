@@ -142,7 +142,7 @@ class ChessBrainNode(Node):
 
     @staticmethod
     def _parse_ack(data: str):
-        """Tách '<cmd>:<uci>[: <reason>]'; legacy bare-uci -> cmd=0."""
+        """Tách '<cmd>:<uci>[: <reason>]'; dữ liệu sai format trả cmd=0."""
         parts = data.split(":", 2)
         if len(parts) >= 2 and parts[0].strip().lstrip("-").isdigit():
             cmd = int(parts[0].strip())
@@ -156,15 +156,12 @@ class ChessBrainNode(Node):
             self.get_logger().warning(f"[FAIL] ACK dư thừa (không chờ): {msg.data}")
             return
         cmd, uci, _ = self._parse_ack(msg.data)
-        if uci != self.inflight_uci or not (cmd == self.inflight_cmd or cmd == 0):
+        if uci != self.inflight_uci or cmd != self.inflight_cmd:
             self.get_logger().warning(
                 f"[FAIL] ACK sai nước: nhận cmd={cmd} {uci}, đang chờ "
                 f"cmd={self.inflight_cmd} {self.inflight_uci}"
             )
             return
-        if cmd == 0:
-            self.get_logger().warning(
-                "[WARN] ACK legacy không có command_id; chấp nhận theo UCI.")
         # Commit board SAU ACK khớp — đây mới là lúc nước đi chắc chắn xong.
         self.board.push(self.inflight_move)
         self.waiting_for_ack = False
@@ -180,7 +177,7 @@ class ChessBrainNode(Node):
         if not self.waiting_for_ack:
             self.get_logger().warning(f"[FAIL] NACK dư thừa (không chờ): {msg.data}")
             return
-        if uci not in (self.inflight_uci, "?") or not (cmd == self.inflight_cmd or cmd == 0):
+        if uci not in (self.inflight_uci, "?") or cmd != self.inflight_cmd:
             self.get_logger().warning(
                 f"[FAIL] NACK sai nước: nhận cmd={cmd} {msg.data}, đang chờ "
                 f"cmd={self.inflight_cmd} {self.inflight_uci}"
