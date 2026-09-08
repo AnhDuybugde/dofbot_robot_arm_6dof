@@ -1036,21 +1036,28 @@ class PickPlaceNode(Node):
 
         quat_xyzw: orientation giữ suốt đoạn đi. Nên truyền quaternion đã chốt
         sau approach (xem _current_tcp_quat); None = đọc TF hiện tại (giữ hành
-        vi cũ cho caller đơn lẻ). Nếu Cartesian path không hoàn thành 100%,
-        raise rõ ràng thay vì fallback âm thầm (trừ khi
-        ALLOW_CARTESIAN_FALLBACK=True được bật tường minh cho demo).
+        vi cũ cho caller đơn lẻ). Thử 2 lần: lần 1 orientation chặt (0.03),
+        lần 2 nới (0.06) cho near-miss/flake của planner — lệch ~3 độ khi nâng
+        không ảnh hưởng gắp. Cả 2 fail mới raise rõ ràng thay vì fallback âm
+        thầm (trừ khi ALLOW_CARTESIAN_FALLBACK=True được bật tường minh).
         """
         q = quat_xyzw if quat_xyzw is not None else self._current_tcp_quat()
-        trajectory = self._plan_motion(
-            position=[x, y, z],
-            quat_xyzw=q,
-            target_link=END_EFFECTOR,
-            tolerance_position=0.002,
-            tolerance_orientation=0.03,
-            cartesian=True,
-            max_step=0.002,
-            cartesian_fraction_threshold=0.999,
-        )
+        for attempt, tol_ori in ((1, 0.03), (2, 0.06)):
+            trajectory = self._plan_motion(
+                position=[x, y, z],
+                quat_xyzw=q,
+                target_link=END_EFFECTOR,
+                tolerance_position=0.002,
+                tolerance_orientation=tol_ori,
+                cartesian=True,
+                max_step=0.002,
+                cartesian_fraction_threshold=0.999,
+            )
+            if trajectory is not None:
+                if attempt == 2:
+                    self.get_logger().warning(
+                        f"[WARN] {step_name} đạt ở lần 2 (nới orientation 0.06)")
+                break
         if trajectory is None:
             if SIMULATION_IGNORE_COLLISIONS and ALLOW_CARTESIAN_FALLBACK:
                 # Opt-in tường minh cho demo: cho phép planner position-only
