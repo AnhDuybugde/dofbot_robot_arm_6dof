@@ -126,8 +126,10 @@ ros2 service call /chess/check_reachability std_srvs/srv/Trigger '{}'
 ```
 
 Terminal đang chạy launch sẽ in danh sách ô không có IK ở cả `approach` và
-`pick`. Layout hiện tại có hiệu chuẩn riêng cho mép gần robot: `c1`, `d1`,
-`e1`, `f1` dùng pre-grasp TCP `z=0.100 m`, còn các ô khác dùng `z=0.125 m`.
+`pick`. Bảng approach đã đo IK thực tế (KDL position-only): `c1`/`f1` dùng
+pre-grasp TCP `z=0.100 m`, riêng `d1`→`z=0.080 m` và `e1`→`z=0.070 m` (hai ô
+file giữa sát đế không có nghiệm KDL ở vùng cao — xem `SQUARE_APPROACH_OFFSET`
+trong `chess_utils.py`); các ô còn lại dùng `z=0.125 m`.
 Đoạn mang quân theo phương ngang vẫn luôn ở `z=0.125 m`. Nếu còn ô lỗi sau
 kiểm tra, chỉnh `BOARD_ORIGIN`, `SQUARE_SIZE` hoặc xoay/đặt lại bàn; không chạy
 self-play trên layout đó. Tune `PICK_TCP_Z` từng bước 2--3 mm trong RViz đến

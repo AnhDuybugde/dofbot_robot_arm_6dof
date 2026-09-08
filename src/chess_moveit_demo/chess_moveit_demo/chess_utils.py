@@ -22,6 +22,16 @@ APPROACH_HEIGHT = 0.070                 # độ cao approach/lift phía trên qu
 # còn lại.
 NEAR_EDGE_APPROACH_HEIGHT = 0.045
 LOW_APPROACH_SQUARES = frozenset({"c1", "d1", "e1", "f1"})
+# Đo IK thực tế (KDL position-only qua /compute_ik, 06/2026): hai ô file giữa
+# ở rank 1 (x=0.095, gần đế robot nhất, gần như chính diện) KHÔNG có nghiệm
+# ở vùng cao:
+#   e1 (0.095, 0.013): OK ở z<=0.070, FAIL mọi z từ 0.080 tới 0.135
+#   d1 (0.095, -0.014): OK ở z<=0.080, FAIL từ 0.090 trở lên
+# c1/f1 (lệch tâm) OK ở 0.100. Vì vậy e1/d1 dùng offset approach riêng thấp
+# hơn (giá trị = cao độ TCP tuyệt đối đã verify có IK):
+#   e1 -> 0.070, d1 -> 0.080. Quân mục tiêu đã được gỡ khỏi scene trước khi
+# plan pre-grasp nên approach thấp không gây va chạm giả với chính nó.
+SQUARE_APPROACH_OFFSET = {"e1": 0.015, "d1": 0.025}
 # Cao độ TCP (Gripping_point_Link) tại lúc ngón kẹp đúng quân. Đây là tham số
 # calibration của ROBOT, không phải chiều cao của quân.  Bắt đầu ở 55 mm để
 # tránh TCP chạm bàn; hãy tune +/- 2--3 mm trên RViz rồi mới dùng robot thật.
@@ -88,7 +98,12 @@ def approach_tcp_z(square: str, pick_tcp_z: float = PICK_TCP_Z) -> float:
 
     Hàng 1 là mép gần robot vì rank tăng theo +X.  Hàm này là calibration
     theo ô, tách bạch với ``APPROACH_HEIGHT`` (cao độ an toàn để vận chuyển).
+
+    e1/d1 có override riêng trong ``SQUARE_APPROACH_OFFSET`` vì KDL không giải
+    được pose cao ở hai ô này (xem chú thích ở hằng số).
     """
+    if square in SQUARE_APPROACH_OFFSET:
+        return pick_tcp_z + SQUARE_APPROACH_OFFSET[square]
     height = (
         NEAR_EDGE_APPROACH_HEIGHT
         if square in LOW_APPROACH_SQUARES

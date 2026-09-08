@@ -144,17 +144,21 @@ class PickPlaceNode(Node):
                 size=[0.216, 0.216, 0.02],
             )
 
-        self._publish_board_visual()
+        self._publish_board_visual(publish=False)
         for square, piece in self.board.piece_map().items():
-            self._add_piece_collision(chess.square_name(square), piece)
+            self._add_piece_collision(chess.square_name(square), piece, publish=False)
+        # FPS fix: startup trước đây publish 1 snapshot full (64 ô + N quân)
+        # sau MỖI quân (33 lần) + mỗi add_collision_* trigger 1 planning-scene
+        # diff -> RViz update storm. Giờ chỉ publish 1 lần duy nhất.
+        self._publish_all_visual()
 
-    def _add_piece_collision(self, square: str, piece: chess.Piece):
+    def _add_piece_collision(self, square: str, piece: chess.Piece, publish: bool = True):
         obj_id = self._new_piece_id()
         self.piece_id_by_square[square] = obj_id
         self.piece_info_by_id[obj_id] = (piece.symbol().lower(), piece.color)
         x, y = square_to_xy(square)
         self._add_piece_collision_at(obj_id, (x, y, BOARD_Z), piece.symbol().lower())
-        self._publish_piece_visual(obj_id, (x, y, BOARD_Z))
+        self._publish_piece_visual(obj_id, (x, y, BOARD_Z), publish=publish)
 
     def _add_piece_collision_at(self, obj_id: str, xyz, piece_type: str):
         if SIMULATION_IGNORE_COLLISIONS:
@@ -169,7 +173,7 @@ class PickPlaceNode(Node):
             radius=0.012,
         )
 
-    def _publish_board_visual(self):
+    def _publish_board_visual(self, publish: bool = True):
         """Bàn 8x8 và 32 quân có màu riêng; đây là visual layer, tách với
         collision layer mà MoveIt dùng để tránh va chạm."""
         markers = MarkerArray()
@@ -197,9 +201,10 @@ class PickPlaceNode(Node):
             markers.markers.append(marker)
         for marker in markers.markers:
             self._visual_markers[1000 + marker.id] = marker
-        self._publish_all_visual()
+        if publish:
+            self._publish_all_visual()
 
-    def _publish_piece_visual(self, obj_id: str, xyz):
+    def _publish_piece_visual(self, obj_id: str, xyz, publish: bool = True):
         piece_type, is_white = self.piece_info_by_id[obj_id]
         x, y, z = xyz
         spec = PIECE_SPECS[piece_type]
@@ -221,7 +226,8 @@ class PickPlaceNode(Node):
             marker.color.r, marker.color.g, marker.color.b = 0.08, 0.10, 0.13
         marker.color.a = 1.0
         self._visual_markers[marker.id] = marker
-        self._publish_all_visual()
+        if publish:
+            self._publish_all_visual()
 
     def _publish_all_visual(self):
         """Luôn gửi nguyên snapshot, không gửi từng quân rời rạc.
@@ -252,9 +258,12 @@ class PickPlaceNode(Node):
         bàn cờ vẫn giữ collision bình thường.
         """
         obj_id = self.piece_id_by_square.pop(square)
-        self.moveit2.remove_collision_object(id=obj_id)
-        # PlanningScene cập nhật bất đồng bộ; tránh lập plan ngay trong cùng tick.
-        time.sleep(0.15)
+        # Ở mode demo bỏ collision, object chưa từng được add nên skip remove
+        # để khỏi spam warn "does not exist in this scene" mỗi nước đi.
+        if not SIMULATION_IGNORE_COLLISIONS:
+            self.moveit2.remove_collision_object(id=obj_id)
+            # PlanningScene cập nhật bất đồng bộ; tránh lập plan ngay trong cùng tick.
+            time.sleep(0.15)
         return obj_id
 
     def _restore_piece_to_world(self, square: str, obj_id: str, piece_type: str):
@@ -446,7 +455,7 @@ class PickPlaceNode(Node):
                 # làm goal bị coi là va chạm và cho ra false negative.
                 obj_id = self.piece_id_by_square.get(name)
                 piece_type = self.piece_info_by_id[obj_id][0] if obj_id else None
-                if obj_id:
+                if obj_id and not SIMULATION_IGNORE_COLLISIONS:
                     self.moveit2.remove_collision_object(id=obj_id)
                     time.sleep(0.15)
                 try:
@@ -460,7 +469,7 @@ class PickPlaceNode(Node):
                         if trajectory is None:
                             failures[phase].append(name)
                 finally:
-                    if obj_id:
+                    if obj_id and not SIMULATION_IGNORE_COLLISIONS:
                         self._restore_piece_collision(name, obj_id, piece_type)
 
             for phase, squares in failures.items():
@@ -484,9 +493,10 @@ class PickPlaceNode(Node):
         x0, y0, z0 = square_to_grasp_pose(from_sq, piece_type)
         x1, y1, z1 = square_to_grasp_pose(to_sq, placed_piece_type or piece_type)
         gripper_open = PIECE_SPECS[piece_type].gripper_open
-        # Ở c1--f1, Z vận chuyển chuẩn 0.125 m không có IK. Vì vậy arm chỉ
-        # nâng thẳng đến approach riêng của ô nguồn, rồi dùng position-only
-        # OMPL để rời vùng gần đế robot sang approach của ô đích.
+        # Ở c1/d1/e1/f1, nâng thẳng đứng (Cartesian) lên cao độ vận chuyển
+        # chuẩn 0.125 m là vô nghiệm IK. Vì vậy arm chỉ nâng thẳng đến
+        # approach riêng của ô nguồn (xem approach_tcp_z), rồi dùng
+        # position-only OMPL để rời vùng gần đế robot sang approach của ô đích.
         source_approach_z = approach_tcp_z(from_sq, z0)
         target_approach_z = approach_tcp_z(to_sq, z1)
         obj_id = None

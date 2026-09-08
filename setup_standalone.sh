@@ -29,6 +29,7 @@ else
     echo "ERROR: src/dofbot_urdf missing."
     echo "Copy the Yahboom dofbot_urdf package (from robot image / SDK)"
     echo "into $SRC/dofbot_urdf, then re-run this script."
+    echo "Driver/resources: https://drive.google.com/drive/folders/1N8DdsQJRkj8_7xfk3T-jFWvssnKH7QYD?usp=sharing"
     exit 1
   fi
 fi

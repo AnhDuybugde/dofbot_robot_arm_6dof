@@ -206,8 +206,16 @@ static void addTriangle(
 
 static MeshData loadSTL(
     const std::string& path,
-    double scale)
+    double scale,
+    size_t stride=1)
 {
+    // FPS fix: Teapot 327k tris + Cup 150k tris -> planning-scene diff
+    // ~500k tris mỗi update giết FPS RViz + FCL. stride giữ mỗi Nth triangle
+    // cho COLLISION; visual Marker vẫn dùng full mesh_resource.
+    size_t tri_index=0;
+    auto keep=[&](){
+        return (tri_index++%stride)==0;
+    };
     std::ifstream f(
         path,
         std::ios::binary
@@ -253,6 +261,7 @@ static MeshData loadSTL(
                     sizeof(v)
                 );
 
+                if(!keep()) continue;
                 addTriangle(
                     out,
                     v[0],v[1],v[2],
@@ -311,6 +320,7 @@ static MeshData loadSTL(
         );
 
     for(size_t i=0;i<values.size();i+=9){
+        if(!keep()) continue;
         addTriangle(
             out,
             values[i+0],
@@ -458,8 +468,12 @@ public:
             visualization_msgs::msg::MarkerArray
         >("/tea_scene",scene_qos);
         publishVisualScene();
+        // FPS fix: visual scene is transient_local latched; 500ms re-publish of
+        // 2x high-poly mesh markers (Teapot 16MB + Cup 7MB) forced RViz mesh
+        // reload + redraw at 2Hz even when idle. 2s heartbeat is enough for
+        // late-joining RViz; moves call publishVisualScene() on demand.
         scene_timer_=node_->create_wall_timer(
-            500ms,[this](){ publishVisualScene(); }
+            2000ms,[this](){ publishVisualScene(); }
         );
 
         service_group_=
@@ -649,19 +663,22 @@ private:
             cup_mesh_=
                 loadSTL(
                     cup_path,
-                    cup_scale_
+                    cup_scale_,
+                    75 // 150k -> ~2k tris collision
                 );
 
             pot_mesh_=
                 loadSTL(
                     pot_path,
-                    pot_scale_
+                    pot_scale_,
+                    150 // 327k -> ~2.2k tris collision
                 );
 
             cal_cup_mesh_=
                 loadSTL(
                     cup_path,
-                    cal_cup_scale_
+                    cal_cup_scale_,
+                    75
                 );
 
             RCLCPP_INFO(
