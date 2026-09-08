@@ -31,15 +31,18 @@ from moveit_msgs.msg import (
     AllowedCollisionEntry,
     AttachedCollisionObject,
     CollisionObject,
+    MoveItErrorCodes,
     PlanningSceneComponents,
     RobotState,
 )
 from moveit_msgs.srv import (
     ApplyPlanningScene,
     GetPlanningScene,
+    GetPositionFK,
     GetPositionIK,
     GetStateValidity,
 )
+from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -185,6 +188,12 @@ class PickPlaceNode(Node):
         )
         self._ik_client = self.create_client(
             GetPositionIK, "/compute_ik", callback_group=cb_group
+        )
+        # FK để validate điểm cuối trajectory hạ đặt TRƯỚC execute (không đạt
+        # pose bù thì loại, không kẹp hớ). Không wait blocking ở init: fail-closed
+        # lúc dùng (raise nếu service vắng) để không treo startup.
+        self._fk_client = self.create_client(
+            GetPositionFK, "/compute_fk", callback_group=cb_group
         )
         self._apply_scene_client.wait_for_service(timeout_sec=10.0)
         self._get_scene_client.wait_for_service(timeout_sec=10.0)
@@ -702,9 +711,27 @@ class PickPlaceNode(Node):
             aw * bw - ax * bx - ay * by - az * bz,
         )
 
+    @staticmethod
+    def _tilt_from_quaternion(q_xyzw) -> float:
+        """Góc nghiêng (rad) giữa trục Z của vật và trục Z thế giới, BỎ QUA yaw.
+
+        Đo sai cũ (2·acos(|qw|)) so toàn bộ quaternion với identity nên yaw
+        thuần 131° cũng bị tính thành 'nghiêng 131°'. Chỉ lấy thành phần z của
+        R(q)·ẑ = 1−2(x²+y²): yaw-only cho đúng 0.
+        """
+        x, y, _z, _w = q_xyzw
+        vz = max(-1.0, min(1.0, 1.0 - 2.0 * (x * x + y * y)))
+        return math.acos(vz)
+
     def _verify_attached_piece_target(self, obj_id: str, target_xy,
-                                      piece_type: str, timeout_sec: float = 1.0):
-        """Xác nhận tâm quân và độ thẳng đứng trước khi mở kẹp."""
+                                      piece_type: str, requested_tcp=None,
+                                      timeout_sec: float = 1.0):
+        """Xác nhận tâm quân và độ thẳng đứng trước khi mở kẹp.
+
+        Độ thẳng = TILT (góc trục Z quân vs Z thế giới), bỏ qua yaw vì đặt cho
+        phép xoay quanh trục đứng. requested_tcp (pose TCP đã bù) chỉ để log
+        phân biệt lỗi IK/transform/TF khi fail.
+        """
         local = self._grasp_local_by_id.get(obj_id)
         if local is None:
             raise RuntimeError(f"thiếu T_tcp_piece của {obj_id} trước detach")
@@ -726,16 +753,20 @@ class PickPlaceNode(Node):
             position_error = math.sqrt(sum(
                 (got - want) ** 2 for got, want in zip(actual, expected)))
             q_piece = self._multiply_quaternions(q_tcp, q_local)
-            norm = math.sqrt(sum(value * value for value in q_piece))
-            if norm < 1e-9:
-                raise RuntimeError(f"quaternion quân {obj_id} không hợp lệ")
-            upright_error = 2.0 * math.acos(min(1.0, abs(q_piece[3] / norm)))
-            if position_error <= 0.005 and upright_error <= math.radians(5.0):
+            tilt = self._tilt_from_quaternion(q_piece)
+            if position_error <= 0.005 and tilt <= math.radians(5.0):
                 return
             if time.monotonic() >= deadline:
+                req = ("không rõ" if requested_tcp is None else
+                       f"xyz={[round(v, 4) for v in requested_tcp[:3]]} "
+                       f"quat={[round(v, 3) for v in requested_tcp[3]]}")
                 raise RuntimeError(
-                    f"pose quân trước detach sai: position_error={position_error:.4f}m, "
-                    f"upright_error={math.degrees(upright_error):.1f}deg")
+                    f"pose quân trước detach sai: tâm quân thực tế "
+                    f"={[round(v, 4) for v in actual]} muốn={expected} "
+                    f"(lệch {position_error:.4f}m), nghiêng "
+                    f"(bỏ yaw)={math.degrees(tilt):.1f}deg; TCP yêu cầu {req}, "
+                    f"TCP thực tế xyz={[round(v, 4) for v in (t.x, t.y, t.z)]} "
+                    f"quat={[round(v, 3) for v in q_tcp]}")
             time.sleep(0.02)
 
     def _scene_object_ids(self):
@@ -1706,9 +1737,12 @@ class PickPlaceNode(Node):
                 preferred_quat=self._current_tcp_quat())
             # Sắp chạm mặt bàn ở điểm đặt: MỞ board-contact trước khi hạ.
             self._set_piece_collision(obj_id, gripper_touch=True, board_contact=True)
-            self._move_vertical(*place_tcp[:3], "hạ đặt", quat_xyzw=place_tcp[3])
+            self._move_vertical_place(
+                place_tcp, "hạ đặt", obj_id, (x1, y1),
+                placed_piece_type or piece_type)
             self._verify_attached_piece_target(
-                obj_id, (x1, y1), placed_piece_type or piece_type)
+                obj_id, (x1, y1), placed_piece_type or piece_type,
+                requested_tcp=place_tcp)
             self._set_gripper(gripper_open)
             self._carry_state = "DETACH_PENDING"
             self._detach_piece(
@@ -1757,8 +1791,10 @@ class PickPlaceNode(Node):
                 obj_id, (xd, yd), discard_tcp_z, piece_type,
                 preferred_quat=self._current_tcp_quat())
             self._set_piece_collision(obj_id, gripper_touch=True, board_contact=True)
-            self._move_vertical(*drop_tcp[:3], "hạ thả quân bị ăn", quat_xyzw=drop_tcp[3])
-            self._verify_attached_piece_target(obj_id, (xd, yd), piece_type)
+            self._move_vertical_place(
+                drop_tcp, "hạ thả quân bị ăn", obj_id, (xd, yd), piece_type)
+            self._verify_attached_piece_target(
+                obj_id, (xd, yd), piece_type, requested_tcp=drop_tcp)
             self._set_gripper(PIECE_SPECS[piece_type].gripper_open)
             self._carry_state = "DETACH_PENDING"
             self._detach_piece(obj_id, None, (xd, yd, zd), piece_type)
@@ -2008,35 +2044,127 @@ class PickPlaceNode(Node):
         q = transform.transform.rotation
         return [q.x, q.y, q.z, q.w]
 
+    def _fk_tcp_pose(self, joint_names, joint_positions):
+        """FK qua /compute_fk ra pose TCP (xyz + quat). Fail-closed: service
+        vắng thì raise thay vì cho execute mù."""
+        if not self._fk_client.wait_for_service(timeout_sec=3.0):
+            raise RuntimeError(
+                "service /compute_fk không sẵn sàng (không FK-validate được pose đặt)")
+        req = GetPositionFK.Request()
+        req.header.frame_id = BASE_LINK
+        req.fk_link_names = [END_EFFECTOR]
+        js = JointState()
+        js.name = list(joint_names)
+        js.position = [float(v) for v in joint_positions]
+        req.robot_state.joint_state = js
+        future = self._fk_client.call_async(req)
+        deadline = time.monotonic() + 5.0
+        while not future.done():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("/compute_fk timeout khi FK-validate pose đặt")
+            time.sleep(0.01)
+        result = future.result()
+        if result is None or result.error_code.val != MoveItErrorCodes.SUCCESS:
+            code = None if result is None else result.error_code.val
+            raise RuntimeError(f"/compute_fk báo lỗi (code={code}) khi FK-validate pose đặt")
+        if not result.pose_stamped:
+            raise RuntimeError("/compute_fk không trả pose khi FK-validate pose đặt")
+        p = result.pose_stamped[0].pose
+        return ((p.position.x, p.position.y, p.position.z),
+                (p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w))
+
+    def _validate_place_trajectory_end(self, trajectory, obj_id: str, target_xy,
+                                       piece_type: str, requested_tcp, step_name: str):
+        """Dùng FK kiểm tra ĐIỂM CUỐI trajectory hạ đặt TRƯỚC execute.
+
+        IK position-only có thể thực hiện orientation khác với quat đã dùng để
+        tính bù TCP: dù TCP tới đúng XYZ thì tâm quân vẫn lệch. FK điểm cuối +
+        T_tcp_piece cho tâm quân và độ nghiêng THỰC SẼ ĐẠT; không đạt ngưỡng
+        (5 mm / 5°) thì raise kèm đủ pose để phân biệt lỗi IK, transform hay TF.
+        """
+        last = trajectory.points[-1]
+        (fx, fy, fz), fq = self._fk_tcp_pose(trajectory.joint_names, last.positions)
+        local = self._grasp_local_by_id.get(obj_id)
+        if local is None:
+            raise RuntimeError(f"thiếu T_tcp_piece của {obj_id} khi FK-validate {step_name}")
+        pl = (local.position.x, local.position.y, local.position.z)
+        ql = (local.orientation.x, local.orientation.y,
+              local.orientation.z, local.orientation.w)
+        rx, ry, rz = self._rotate_by_quaternion(pl, fq)
+        center = (fx + rx, fy + ry, fz + rz)
+        spec = PIECE_SPECS[piece_type]
+        want = (target_xy[0], target_xy[1], BOARD_Z + spec.pickup_height / 2)
+        position_error = math.sqrt(sum(
+            (got - w) ** 2 for got, w in zip(center, want)))
+        q_piece = self._multiply_quaternions(fq, ql)
+        tilt = self._tilt_from_quaternion(q_piece)
+        if position_error <= 0.005 and tilt <= math.radians(5.0):
+            return
+        raise RuntimeError(
+            f"FK cuối trajectory {step_name} không đạt pose đặt: "
+            f"TCP yêu cầu xyz={[round(v, 4) for v in requested_tcp[:3]]} "
+            f"quat={[round(v, 3) for v in requested_tcp[3]]}; "
+            f"TCP FK xyz={[round(v, 4) for v in (fx, fy, fz)]} "
+            f"quat={[round(v, 3) for v in fq]}; "
+            f"tâm quân FK={[round(v, 4) for v in center]} muốn={want} "
+            f"(lệch {position_error:.4f}m), nghiêng (bỏ yaw)={math.degrees(tilt):.1f}deg. "
+            f"Khả năng: IK position-only thực hiện orientation khác quat tính bù.")
+
     def _move_vertical(self, x, y, z, step_name: str, quat_xyzw=None):
         """Đi thẳng đứng bằng compute_cartesian_path, không để OMPL lách qua
         bàn/quân trong đoạn hạ hoặc nâng.
 
         quat_xyzw: orientation giữ suốt đoạn đi. Nên truyền quaternion đã chốt
         sau approach (xem _current_tcp_quat); None = đọc TF hiện tại (giữ hành
-        vi cũ cho caller đơn lẻ). Thử 2 lần: lần 1 orientation chặt (0.03),
-        lần 2 nới (0.06) cho near-miss/flake của planner — lệch ~3 độ khi nâng
-        không ảnh hưởng gắp. Cả 2 fail mới raise rõ ràng thay vì fallback âm
-        thầm (trừ khi ALLOW_CARTESIAN_FALLBACK=True được bật tường minh).
+        vi cũ cho caller đơn lẻ). Plan fail mới raise rõ ràng thay vì fallback
+        âm thầm (trừ khi ALLOW_CARTESIAN_FALLBACK=True được bật tường minh cho
+        demo). Bước HẠ ĐẶT không dùng hàm này mà dùng _move_vertical_place để
+        FK-validate pose quân trước execute.
         """
         q = quat_xyzw if quat_xyzw is not None else self._current_tcp_quat()
+        trajectory = self._plan_vertical_or_raise(x, y, z, q, step_name)
+        if trajectory is None:
+            self.get_logger().warning(
+                f"Cartesian không đủ tại {step_name}; dùng position-only fallback tới {(x, y, z)}"
+            )
+            self._move_to(x, y, z)
+            return
+        self._execute_and_wait(self.moveit2, trajectory)
+
+    def _plan_vertical_or_raise(self, x, y, z, q, step_name: str):
+        """Plan Cartesian hoặc raise (kèm chẩn đoán), giữ nguyên fallback opt-in."""
         trajectory = self._plan_vertical_trajectory(x, y, z, q, step_name)
         if trajectory is None:
             self._diagnose_position_goal_collision(
                 (x, y, z), q, f"cartesian/{step_name}/{(x, y, z)}"
             )
             if not COLLISION_ENABLED and ALLOW_CARTESIAN_FALLBACK:
-                self.get_logger().warning(
-                    f"Cartesian không đủ tại {step_name}; dùng position-only fallback tới {(x, y, z)}"
-                )
-                self._move_to(x, y, z)
-                return
+                return None
             raise RuntimeError(
                 f"Không có Cartesian path an toàn khi {step_name} tới {(x, y, z)} "
                 f"(quat giữ {[round(v, 3) for v in q]}). "
                 f"Hãy chạy /chess/check_reachability để xem ô/phase lỗi, "
                 f"kiểm tra approach offset và orientation sau approach."
             )
+        return trajectory
+
+    def _move_vertical_place(self, place_tcp, step_name: str, obj_id: str,
+                             target_xy, piece_type: str):
+        """Hạ đặt: plan -> FK-validate điểm cuối (tâm quân + nghiêng) -> execute.
+
+        Không đạt thì raise TRƯỚC khi arm nhúc nhích: caller loại candidate /
+        NACK thay vì đặt lệch rồi mới phát hiện ở _verify.
+        """
+        trajectory = self._plan_vertical_or_raise(
+            *place_tcp[:3], place_tcp[3], step_name)
+        if trajectory is None:
+            self.get_logger().warning(
+                f"Cartesian không đủ tại {step_name}; dùng position-only fallback tới {place_tcp[:3]}"
+            )
+            self._move_to(*place_tcp[:3])
+            return
+        self._validate_place_trajectory_end(
+            trajectory, obj_id, target_xy, piece_type, place_tcp, step_name)
         self._execute_and_wait(self.moveit2, trajectory)
 
     def _plan_vertical_trajectory(self, x, y, z, q, step_name):
