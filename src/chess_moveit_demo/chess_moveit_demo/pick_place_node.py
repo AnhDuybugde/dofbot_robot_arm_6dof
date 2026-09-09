@@ -508,10 +508,10 @@ class PickPlaceNode(Node):
                 if any(abs(a - b) > 1e-6 for a, b in zip(
                         d, expected_board[3:])):
                     reasons.append(f"chessboard geometry sai: {d}")
-                pp = obj.primitive_poses[0].position if obj.primitive_poses else obj.pose.position
-                if (abs(pp.x - expected_board[0]) > SCENE_VERIFY_POS_TOL_M
-                        or abs(pp.y - expected_board[1]) > SCENE_VERIFY_POS_TOL_M
-                        or abs(pp.z - expected_board[2]) > SCENE_VERIFY_POS_TOL_M):
+                pp = self._collision_object_center(obj)
+                if (abs(pp[0] - expected_board[0]) > SCENE_VERIFY_POS_TOL_M
+                        or abs(pp[1] - expected_board[1]) > SCENE_VERIFY_POS_TOL_M
+                        or abs(pp[2] - expected_board[2]) > SCENE_VERIFY_POS_TOL_M):
                     reasons.append("chessboard pose sai > 5mm")
             elif obj.id.startswith("piece_"):
                 info = self.piece_info_by_id.get(obj.id)
@@ -542,13 +542,34 @@ class PickPlaceNode(Node):
             ptype, _c = info
             ex, ey = square_to_xy(sq)
             ez = BOARD_Z + PIECE_COLLISION[ptype]["height"] / 2
-            pp = obj.primitive_poses[0].position if obj.primitive_poses else obj.pose.position
-            if (abs(pp.x - ex) > SCENE_VERIFY_POS_TOL_M
-                    or abs(pp.y - ey) > SCENE_VERIFY_POS_TOL_M
-                    or abs(pp.z - ez) > SCENE_VERIFY_POS_TOL_M):
+            pp = self._collision_object_center(obj)
+            if (abs(pp[0] - ex) > SCENE_VERIFY_POS_TOL_M
+                    or abs(pp[1] - ey) > SCENE_VERIFY_POS_TOL_M
+                    or abs(pp[2] - ez) > SCENE_VERIFY_POS_TOL_M):
                 reasons.append(f"{obj.id} pose sai > 5mm so với ô {sq}")
                 break  # gọn log, 1 mẫu đã đủ báo
         return reasons
+
+    @staticmethod
+    def _collision_object_center(obj: CollisionObject) -> tuple[float, float, float]:
+        """Tâm world của primitive đầu: compose obj.pose + primitive_poses[0].
+
+        MoveIt có thể trả transform world ở obj.pose hay primitive_poses tùy
+        phiên bản/call path (giống _wait_for_scene_pose); compose cả hai mới
+        kiểm tra đúng tâm cylinder/box.
+        """
+        op = obj.pose.position
+        oq = obj.pose.orientation
+        oq_tuple = (oq.x, oq.y, oq.z, oq.w)
+        if sum(v * v for v in oq_tuple) < 1e-12:
+            oq_tuple = (0.0, 0.0, 0.0, 1.0)
+        if obj.primitive_poses:
+            pp = obj.primitive_poses[0].position
+            rx, ry, rz = PickPlaceNode._rotate_by_quaternion(
+                (pp.x, pp.y, pp.z), oq_tuple)
+        else:
+            rx = ry = rz = 0.0
+        return (op.x + rx, op.y + ry, op.z + rz)
 
     def _planner_ready(self) -> bool:
         try:
