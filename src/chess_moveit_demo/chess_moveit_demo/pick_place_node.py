@@ -4115,6 +4115,24 @@ class PickPlaceNode(Node):
         return self._move_vertical_place_compensated(
             candidates, step_name, obj_id, target_xy, piece_type, approach_z)
 
+    @staticmethod
+    def _fingerprint_diff(old, new) -> str:
+        """Mô tả ngắn gọn phần fingerprint lệch (world/attached/names/pairs)."""
+        try:
+            if old is None or new is None:
+                return "thiếu snapshot"
+            sections = ("world", "attached", "acm-names", "acm-pairs")
+            for name, o, n in zip(sections, old, new):
+                if o != n:
+                    so, sn = set(map(str, o)), set(map(str, n))
+                    only_old = sorted(so - sn)[:3]
+                    only_new = sorted(sn - so)[:3]
+                    return (f"{name} khác (old={len(o)} new={len(n)} "
+                            f"chỉ-cũ={only_old} chỉ-mới={only_new})")
+            return "không rõ (so sánh tổng thể lệch)"
+        except Exception as exc:
+            return f"không diff được ({exc})"
+
     def _try_execute_cached_carry_chain(self, verified, obj_id: str,
                                        dest_piece_type: str, target_xy,
                                        label: str):
@@ -4163,8 +4181,12 @@ class PickPlaceNode(Node):
                     "source", f"attached state sai (attached={sorted(attached)})")
             current_fingerprint = self._scene_cache_fingerprint(obj_id)
             if current_fingerprint != verified.get("scene_fingerprint"):
+                detail = self._fingerprint_diff(
+                    verified.get("scene_fingerprint"), current_fingerprint)
+                self.get_logger().warning(
+                    f"[CACHED] {label}: fingerprint lệch: {detail}")
                 return _fallback(
-                    "source", "pose/geometry/attached/ACM của scene đã đổi")
+                    "source", f"pose/geometry/attached/ACM của scene đã đổi ({detail})")
         except Exception as exc:
             return _fallback("source", f"không đối chiếu được scene ({exc})")
 
