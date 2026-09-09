@@ -88,6 +88,35 @@ GRIPPER_TOUCH_LINKS = [
 # SRDF `arm_group/up`: pose joint đã biết, dùng làm điểm đầu/cuối ổn định cho
 # mỗi lượt robot. Đây là joint-goal (PTP), không phải Cartesian target.
 HOME_JOINTS = [0.0, 0.0, 0.0, 0.0, 0.0]
+# Không thử nhiều yaw: IK position-only của Dofbot bỏ qua quaternion nên 8 yaw
+# thường cùng rơi vào một orientation FK. Một candidate ban đầu sẽ được bù XYZ
+# lặp theo chính FK endpoint cho tới khi tâm quân đạt yêu cầu.
+PLACE_YAW_COUNT = 1
+PLACE_YAW_STEP_DEG = 45.0
+# Chỉ tâm quân quyết định PASS khi đặt. Orientation/yaw/tilt của quân được ghi
+# log để chẩn đoán nhưng không còn là constraint của bài toán chơi cờ này.
+PLACE_POSITION_TOL_M = 0.005
+# Sau grasp chỉ lift Cartesian một đoạn ngắn để rời mặt bàn/quân lân cận;
+# phần di chuyển xa giao cho OMPL position-only. Ép giữ orientation suốt một
+# lift dài là nguyên nhân các ô gần biên/đế như b1 chỉ đạt Cartesian ~33%.
+CARRY_CLEARANCE_LIFT_M = 0.020
+# Số vòng fixed-point correction cho TCP place. Vì log cho thấy TCP FK đạt đúng
+# XYZ yêu cầu, cộng trực tiếp sai số tâm quân vào XYZ TCP sẽ hội tụ nhanh dù
+# orientation FK thay đổi nhẹ theo vị trí.
+PLACE_COMPENSATION_MAX_ITERATIONS = 5
+PLACE_COMPENSATION_MAX_STEP_M = 0.020
+# Ngưỡng tái sử dụng chuỗi trajectory đã PASS precheck (không đạt -> fallback
+# plan lại, không phải lỗi fatal). Joint: arm không hề di chuyển giữa precheck
+# và attach (chỉ có gripper), nên start lift phải gần như trùng khớp.
+CACHED_CHAIN_JOINT_TOL_RAD = 0.02
+# T_tcp_piece thật sau khi đóng kẹp so với giả định lúc precheck. Đóng kẹp có
+# thể xê dịch quân nhẹ; endpoint cached được FK-validate LẠI với local thật
+# trước execute nên ngưỡng này chỉ loại nhanh ca xô lệch thô.
+CACHED_LOCAL_POS_TOL_M = 0.004
+CACHED_LOCAL_ANG_TOL_DEG = 8.0
+# GetStateValidity là kiểm tra rời rạc; nội suy waypoint cached sao cho mỗi
+# joint thay đổi tối đa khoảng 1.7° giữa hai mẫu để không chỉ kiểm endpoint.
+CACHED_COLLISION_SAMPLE_RAD = 0.03
 
 
 class PickPlaceNode(Node):
@@ -531,6 +560,10 @@ class PickPlaceNode(Node):
         request.group_name = GROUP_NAME
         request.robot_state = RobotState()
         request.robot_state.joint_state = copy.deepcopy(joint_state)
+        # joint_state chỉ là phần diff so với monitored PlanningScene. Phải
+        # giữ attached collision objects (quân đang mang / scratch); nếu để
+        # False, mảng attached rỗng có thể bị hiểu là xoá toàn bộ attached.
+        request.robot_state.is_diff = True
         future = self._state_validity_client.call_async(request)
         deadline = time.monotonic() + 3.0
         while not future.done():
@@ -569,6 +602,7 @@ class PickPlaceNode(Node):
         ik.avoid_collisions = False
         ik.robot_state = RobotState()
         ik.robot_state.joint_state = copy.deepcopy(self.moveit2.joint_state)
+        ik.robot_state.is_diff = True
         ik.pose_stamped = PoseStamped()
         ik.pose_stamped.header.frame_id = BASE_LINK
         ik.pose_stamped.pose.position.x = float(position[0])
@@ -645,9 +679,12 @@ class PickPlaceNode(Node):
 
     @staticmethod
     def _rotate_by_quaternion(vector, quaternion):
-        """Xoay vector bằng quaternion (x, y, z, w) đã chuẩn hoá."""
-        x, y, z, w = quaternion
-        vx, vy, vz = vector
+        """Xoay vector bằng quaternion (x, y, z, w); validate strict trước."""
+        x, y, z, w = PickPlaceNode._normalize_quaternion(tuple(quaternion))
+        vx, vy, vz = (float(v) for v in vector)
+        for v in (vx, vy, vz):
+            if not math.isfinite(v):
+                raise ValueError(f"vector xoay không hợp lệ (NaN/inf): {vector}")
         tx = 2.0 * (y * vz - z * vy)
         ty = 2.0 * (z * vx - x * vz)
         tz = 2.0 * (x * vy - y * vx)
@@ -669,47 +706,126 @@ class PickPlaceNode(Node):
         TILT (yaw quanh trục đứng tự do) nên chọn yaw ψ của quân ở đích sao cho
         TCP gần preferred_quat nhất: ψ* = 2·atan2(N.z, N.w) với
         N = Q_preferred ⊗ q_local. Không truyền (=None) thì ψ=0 (identity như
-        trước). Trả về (x, y, z, quat_xyzw).
+        trước). Trả về (x, y, z, quat_xyzw) — yaw tối ưu duy nhất (giữ tương
+        thích; flow mới nên dùng _place_tcp_candidates_for_target để thử
+        nhiều yaw).
         """
+        candidates = self._place_tcp_candidates_for_target(
+            obj_id, target_xy, tcp_z_fallback, piece_type, preferred_quat,
+            local_override=None, yaw_count=1)
+        return candidates[0]
+
+    def _optimal_place_yaw(self, q_local, preferred_quat=None) -> float:
+        """Yaw ψ* của quân ở đích để TCP gần preferred nhất (rad)."""
+        ql = self._normalize_quaternion(tuple(q_local))
+        if preferred_quat is None:
+            return 0.0
+        n = self._multiply_quaternions(
+            self._normalize_quaternion(tuple(preferred_quat)), ql)
+        return 2.0 * math.atan2(n[2], n[3])
+
+    @staticmethod
+    def _place_yaw_order(yaw_count: int):
+        """Thứ tự k: 0, +1, -1, +2, -2, ... để thử gần ψ* trước, phủ vòng tròn."""
+        order = [0]
+        for k in range(1, (yaw_count + 1) // 2 + 1):
+            order.append(k)
+            order.append(-k)
+        return order[:max(1, yaw_count)]
+
+    @staticmethod
+    def _quat_angle(a, b) -> float:
+        """Góc (rad) giữa 2 quaternion đã chuẩn hoá; q ≡ -q nên lấy |dot|."""
+        dot = abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3])
+        return 2.0 * math.acos(max(-1.0, min(1.0, dot)))
+
+    def _place_yaw_candidates_for_local(self, local: Pose, target_xy,
+                                       piece_type: str, preferred_quat=None,
+                                       yaw_count: int = PLACE_YAW_COUNT):
+        """Sinh candidate đặt từ T_tcp_piece tường minh.
+
+        Mỗi candidate: Q_tcp(ψk) = Y(ψk) ⊗ conj(q_local), ψk = ψ* + k·step.
+        Trả về list [(place_tcp, k, psi)] theo thứ tự |k·step| tăng dần.
+        Quaternion rác raise (không đoán mò pose).
+        """
+        ql = self._normalize_quaternion(
+            (local.orientation.x, local.orientation.y,
+             local.orientation.z, local.orientation.w))
+        psi_star = self._optimal_place_yaw(ql, preferred_quat)
+        step = math.radians(PLACE_YAW_STEP_DEG)
+        conj = self._normalize_quaternion((-ql[0], -ql[1], -ql[2], ql[3]))
         spec = PIECE_SPECS[piece_type]
         want = (target_xy[0], target_xy[1], BOARD_Z + spec.pickup_height / 2)
-        local = self._grasp_local_by_id.get(obj_id)
+        lx, ly, lz = local.position.x, local.position.y, local.position.z
+        out = []
+        for k in self._place_yaw_order(yaw_count):
+            psi = psi_star + k * step
+            s, c = math.sin(psi / 2.0), math.cos(psi / 2.0)
+            q_tcp = self._multiply_quaternions((0.0, 0.0, s, c), conj)
+            rx, ry, rz = self._rotate_by_quaternion((lx, ly, lz), q_tcp)
+            tcp = (want[0] - rx, want[1] - ry, want[2] - rz)
+            out.append(((*tcp, q_tcp), k, psi))
+        return out
+
+    def _place_tcp_candidates_for_target(self, obj_id: str, target_xy,
+                                         tcp_z_fallback: float,
+                                         piece_type: str, preferred_quat=None,
+                                         local_override=None,
+                                         yaw_count: int = PLACE_YAW_COUNT,
+                                         verified_quat=None):
+        """Sinh initial TCP guess cho vòng bù tâm FK.
+
+        Quaternion chỉ giúp tạo dự đoán ban đầu; IK position-only có thể bỏ
+        qua nó. Kết quả cuối được quyết định bởi tâm quân từ FK, không bởi yaw
+        hay tilt. Trả về list để giữ tương thích API cũ, hiện chỉ có 1 phần tử.
+        """
+        local = local_override if local_override is not None else \
+            self._grasp_local_by_id.get(obj_id)
         if local is None:
             q = self._current_tcp_quat()
             self.get_logger().warning(
                 f"[WARN] {obj_id} không có offset attach -> đặt TCP đúng tâm, "
                 f"quân có thể lệch nếu gắp không chuẩn tâm")
-            return (*target_xy, tcp_z_fallback, q)
-        lx, ly, lz = local.position.x, local.position.y, local.position.z
-        ql = (local.orientation.x, local.orientation.y,
-              local.orientation.z, local.orientation.w)
-        if preferred_quat is not None:
-            # Yaw tối ưu: Q_tcp(ψ) = Y(ψ) ⊗ conj(q_local); cực tiểu góc với
-            # preferred khi tan(ψ/2) = N.z / N.w.
-            n = self._multiply_quaternions(tuple(preferred_quat), ql)
-            half = math.atan2(n[2], n[3])
-            s, c = math.sin(half), math.cos(half)
-            yaw = (0.0, 0.0, s, c)
-            m = (-ql[0], -ql[1], -ql[2], ql[3])
-            q_tcp = self._multiply_quaternions(yaw, m)
-        else:
-            # Quân đứng thẳng ở đích: Q_want = identity -> Q_tcp = conj(q_local).
-            q_tcp = (-ql[0], -ql[1], -ql[2], ql[3])
-        # P_tcp = P_want - R(Q_tcp) * p_local.
-        rx, ry, rz = self._rotate_by_quaternion((lx, ly, lz), q_tcp)
-        tcp = (want[0] - rx, want[1] - ry, want[2] - rz)
-        return (*tcp, q_tcp)
+            return [(*target_xy, tcp_z_fallback,
+                     self._normalize_quaternion(tuple(q)))]
+        yaw_cands = self._place_yaw_candidates_for_local(
+            local, target_xy, piece_type, preferred_quat, yaw_count)
+        if verified_quat is not None:
+            vq = self._normalize_quaternion(tuple(verified_quat))
+            yaw_cands.sort(
+                key=lambda item: self._quat_angle(item[0][3], vq))
+        return [place_tcp for place_tcp, _k, _psi in yaw_cands]
+
+    @staticmethod
+    def _normalize_quaternion(q):
+        """Chuẩn hoá quaternion, FAIL LOUD với dữ liệu rác.
+
+        Quaternion gần zero, NaN hoặc infinity mà âm thầm trả identity sẽ che
+        lỗi TF/dữ liệu và báo tilt 0° giả. Mọi caller muốn pose quân đều phải
+        thấy lỗi rõ ràng thay vì đặt lệch.
+        """
+        x, y, z, w = (float(v) for v in q)
+        for v in (x, y, z, w):
+            if not math.isfinite(v):
+                raise ValueError(
+                    f"quaternion không hợp lệ (NaN/inf): {(x, y, z, w)}")
+        norm = math.sqrt(x * x + y * y + z * z + w * w)
+        if norm < 1e-9:
+            raise ValueError(
+                f"quaternion gần zero (norm={norm:.3e}): {(x, y, z, w)}")
+        return (x / norm, y / norm, z / norm, w / norm)
 
     @staticmethod
     def _multiply_quaternions(a, b):
-        ax, ay, az, aw = a
-        bx, by, bz, bw = b
-        return (
-            aw * bx + ax * bw + ay * bz - az * by,
-            aw * by - ax * bz + ay * bw + az * bx,
-            aw * bz + ax * by - ay * bx + az * bw,
-            aw * bw - ax * bx - ay * by - az * bz,
-        )
+        ax, ay, az, aw = PickPlaceNode._normalize_quaternion(tuple(a))
+        bx, by, bz, bw = PickPlaceNode._normalize_quaternion(tuple(b))
+        x = aw * bx + ax * bw + ay * bz - az * by
+        y = aw * by - ax * bz + ay * bw + az * bx
+        z = aw * bz + ax * by - ay * bx + az * bw
+        w = aw * bw - ax * bx - ay * by - az * bz
+        # Tích 2 quaternion đơn vị không thể triệt tiêu; normalize strict để
+        # mọi sai số số học tích luỹ đều được chặn, không trôi âm thầm.
+        return PickPlaceNode._normalize_quaternion((x, y, z, w))
 
     @staticmethod
     def _tilt_from_quaternion(q_xyzw) -> float:
@@ -717,9 +833,11 @@ class PickPlaceNode(Node):
 
         Đo sai cũ (2·acos(|qw|)) so toàn bộ quaternion với identity nên yaw
         thuần 131° cũng bị tính thành 'nghiêng 131°'. Chỉ lấy thành phần z của
-        R(q)·ẑ = 1−2(x²+y²): yaw-only cho đúng 0.
+        R(q)·ẑ = 1−2(x²+y²): yaw-only cho đúng 0. Chuẩn hoá strict trước vì
+        phép nhân q_tcp × q_local tích luỹ sai số số học dù quaternion MoveIt
+        đã chuẩn; quaternion rác (zero/NaN/inf) raise thay vì báo tilt 0° giả.
         """
-        x, y, _z, _w = q_xyzw
+        x, y, z, w = PickPlaceNode._normalize_quaternion(tuple(q_xyzw))
         vz = max(-1.0, min(1.0, 1.0 - 2.0 * (x * x + y * y)))
         return math.acos(vz)
 
@@ -754,7 +872,7 @@ class PickPlaceNode(Node):
                 (got - want) ** 2 for got, want in zip(actual, expected)))
             q_piece = self._multiply_quaternions(q_tcp, q_local)
             tilt = self._tilt_from_quaternion(q_piece)
-            if position_error <= 0.005 and tilt <= math.radians(5.0):
+            if position_error <= PLACE_POSITION_TOL_M:
                 return
             if time.monotonic() >= deadline:
                 req = ("không rõ" if requested_tcp is None else
@@ -763,8 +881,9 @@ class PickPlaceNode(Node):
                 raise RuntimeError(
                     f"pose quân trước detach sai: tâm quân thực tế "
                     f"={[round(v, 4) for v in actual]} muốn={expected} "
-                    f"(lệch {position_error:.4f}m), nghiêng "
-                    f"(bỏ yaw)={math.degrees(tilt):.1f}deg; TCP yêu cầu {req}, "
+                    f"(lệch {position_error:.4f}m); góc nghiêng tham khảo "
+                    f"(không dùng để FAIL)={math.degrees(tilt):.1f}deg; "
+                    f"TCP yêu cầu {req}, "
                     f"TCP thực tế xyz={[round(v, 4) for v in (t.x, t.y, t.z)]} "
                     f"quat={[round(v, 3) for v in q_tcp]}")
             time.sleep(0.02)
@@ -778,6 +897,115 @@ class PickPlaceNode(Node):
         attached_ids = {aco.object.id for aco in scene.robot_state.attached_collision_objects}
         world_ids = {obj.id for obj in scene.world.collision_objects}
         return attached_ids, world_ids
+
+    def _attached_piece_local_pose(self, obj_id: str) -> Pose:
+        """Đọc T_tcp_piece đúng như PlanningScene đang dùng cho collision."""
+        scene = self._get_planning_scene(
+            PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS)
+        for aco in scene.robot_state.attached_collision_objects:
+            if aco.object.id != obj_id:
+                continue
+            obj = aco.object
+            base = obj.pose
+            bq_raw = (base.orientation.x, base.orientation.y,
+                      base.orientation.z, base.orientation.w)
+            bq = ((0.0, 0.0, 0.0, 1.0)
+                  if sum(v * v for v in bq_raw) < 1e-12
+                  else self._normalize_quaternion(bq_raw))
+            child = obj.primitive_poses[0] if obj.primitive_poses else Pose()
+            cq_raw = (child.orientation.x, child.orientation.y,
+                      child.orientation.z, child.orientation.w)
+            cq = ((0.0, 0.0, 0.0, 1.0)
+                  if sum(v * v for v in cq_raw) < 1e-12
+                  else self._normalize_quaternion(cq_raw))
+            rx, ry, rz = self._rotate_by_quaternion(
+                (child.position.x, child.position.y, child.position.z), bq)
+            out = Pose()
+            out.position.x = base.position.x + rx
+            out.position.y = base.position.y + ry
+            out.position.z = base.position.z + rz
+            oq = self._multiply_quaternions(bq, cq)
+            (out.orientation.x, out.orientation.y,
+             out.orientation.z, out.orientation.w) = oq
+            return out
+        raise RuntimeError(f"PlanningScene không thấy attached object {obj_id}")
+
+    @staticmethod
+    def _pose_signature(pose: Pose):
+        """Chữ ký pose ổn định đủ nhạy để phát hiện scene đổi giữa hai plan."""
+        return tuple(round(float(v), 8) for v in (
+            pose.position.x, pose.position.y, pose.position.z,
+            pose.orientation.x, pose.orientation.y,
+            pose.orientation.z, pose.orientation.w))
+
+    def _collision_object_signature(self, obj: CollisionObject):
+        """Chữ ký pose + geometry; không chỉ ID (ID giữ nguyên vẫn có thể di chuyển)."""
+        primitives = tuple(
+            (int(shape.type), tuple(round(float(v), 8) for v in shape.dimensions))
+            for shape in obj.primitives)
+        meshes = tuple(
+            (
+                tuple(tuple(round(float(v), 8) for v in (p.x, p.y, p.z))
+                      for p in mesh.vertices),
+                tuple(tuple(int(i) for i in tri.vertex_indices)
+                      for tri in mesh.triangles),
+            )
+            for mesh in obj.meshes)
+        planes = tuple(
+            tuple(round(float(v), 8) for v in plane.coef)
+            for plane in obj.planes)
+        return (
+            obj.id, obj.header.frame_id, self._pose_signature(obj.pose),
+            primitives,
+            tuple(self._pose_signature(p) for p in obj.primitive_poses),
+            meshes,
+            tuple(self._pose_signature(p) for p in obj.mesh_poses),
+            planes,
+            tuple(self._pose_signature(p) for p in obj.plane_poses),
+            tuple(obj.subframe_names),
+            tuple(self._pose_signature(p) for p in obj.subframe_poses),
+        )
+
+    def _scene_cache_fingerprint(self, carried_id: str | None):
+        """Fingerprint phần scene phải bất biến khi đổi scratch thành quân thật.
+
+        Scratch và quân đang gắp được loại khỏi fingerprint vì chúng được kiểm
+        riêng bằng geometry cố định + T_tcp_piece. Mọi world pose/geometry,
+        attached object khác và ACM không liên quan tới quân phải giữ nguyên.
+        """
+        scene = self._get_planning_scene(
+            PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+            | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+            | PlanningSceneComponents.ALLOWED_COLLISION_MATRIX)
+        excluded = {"__dry_carry__"}
+        if carried_id:
+            excluded.add(carried_id)
+        world = tuple(sorted(
+            self._collision_object_signature(obj)
+            for obj in scene.world.collision_objects
+            if obj.id not in excluded))
+        attached = tuple(sorted(
+            (
+                aco.link_name,
+                tuple(sorted(aco.touch_links)),
+                self._collision_object_signature(aco.object),
+            )
+            for aco in scene.robot_state.attached_collision_objects
+            if aco.object.id not in excluded))
+
+        acm = scene.allowed_collision_matrix
+        keep = [
+            (i, name) for i, name in enumerate(acm.entry_names)
+            if name not in excluded
+        ]
+        names = tuple(sorted(name for _i, name in keep))
+        enabled_pairs = []
+        for left_pos, (i, left) in enumerate(keep):
+            row = acm.entry_values[i].enabled if i < len(acm.entry_values) else []
+            for j, right in keep[left_pos:]:
+                if j < len(row) and bool(row[j]):
+                    enabled_pairs.append(tuple(sorted((left, right))))
+        return world, attached, names, tuple(sorted(enabled_pairs))
 
     def _reconcile_carry_failure(self, obj_id: str | None, from_sq: str,
                                  piece_type: str, where: str,
@@ -896,12 +1124,17 @@ class PickPlaceNode(Node):
         raise
 
     def _piece_local_pose(self, piece_type: str, piece_world_xy) -> Pose:
-        """Tính T_tcp_piece cho một quân đang đứng trên mặt bàn."""
+        """Tính T_tcp_piece cho một quân đang đứng trên mặt bàn.
+
+        TF rác (quaternion zero/NaN/inf) raise ngay tại đây thay vì tạo pose
+        giả khiến precheck PASS oan.
+        """
         spec = PIECE_SPECS[piece_type]
         transform = self.tf_buffer.lookup_transform(
             BASE_LINK, END_EFFECTOR, rclpy.time.Time())
         tcp = transform.transform.translation
         q = transform.transform.rotation
+        self._normalize_quaternion((q.x, q.y, q.z, q.w))
         center_world = (
             piece_world_xy[0], piece_world_xy[1],
             BOARD_Z + spec.pickup_height / 2)
@@ -1324,14 +1557,13 @@ class PickPlaceNode(Node):
         """
         if not COLLISION_ENABLED:
             return ""
-        obj_id = "__dry_carry__"
-        spec = PIECE_SPECS[piece_type]
         if piece_world_xy is not None:
             pose = self._piece_local_pose(piece_type, piece_world_xy)
         else:
             # Proxy discard bắt đầu đứng thẳng trong BASE_LINK và có tâm thấp
             # hơn TCP đúng bằng quan hệ tại pose gắp chuẩn. Nhờ lưu orientation
             # inverse của TCP, nó xoay theo arm giống một quân đã attach thật.
+            spec = PIECE_SPECS[piece_type]
             transform = self.tf_buffer.lookup_transform(
                 BASE_LINK, END_EFFECTOR, rclpy.time.Time())
             q = transform.transform.rotation
@@ -1343,6 +1575,30 @@ class PickPlaceNode(Node):
             pose.orientation.y = -q.y
             pose.orientation.z = -q.z
             pose.orientation.w = q.w
+        return self._dry_attach_scratch_with_local(
+            pose, piece_type, source_obj_id)
+
+    def _dry_attach_scratch_with_local(self, local_pose: Pose, piece_type: str,
+                                       source_obj_id: str | None = None) -> str:
+        """Attach proxy với T_tcp_piece tường minh (không tự suy từ TF chuẩn).
+
+        Dùng cho precheck chuỗi mang: transform giả định của đúng offset đang
+        thử được giữ xuyên suốt lift → transfer → descend, thay vì pose mặc
+        định chỉ đúng tại pose gắp chuẩn. Attach fail thì raise — caller phải
+        coi là FAIL kiểm tra transfer, không được fallback IK-only rồi PASS.
+        """
+        if not COLLISION_ENABLED:
+            return ""
+        obj_id = "__dry_carry__"
+        spec = PIECE_SPECS[piece_type]
+        pose = copy.deepcopy(local_pose)
+        # Validate strict: pose proxy rác mà attach mù sẽ cho kết quả mang giả.
+        self._normalize_quaternion(
+            (pose.orientation.x, pose.orientation.y,
+             pose.orientation.z, pose.orientation.w))
+        for v in (pose.position.x, pose.position.y, pose.position.z):
+            if not math.isfinite(float(v)):
+                raise ValueError(f"proxy T_tcp_piece NaN/inf: {local_pose}")
         if source_obj_id is not None:
             self.moveit2.remove_collision_object(id=source_obj_id)
             self._wait_for_scene_absence(source_obj_id)
@@ -1655,9 +1911,9 @@ class PickPlaceNode(Node):
                 # hệ thống, không cho game/check chạy tiếp trên scene sai.
                 self._needs_recovery = True
                 self.get_logger().error(
-                    "[RECOVERY-REQUIRED] deep-check execute để lại scene không "
-                    "nhất quán (hoặc carry_state="
-                    f"{self._carry_state}). Restart launch trước khi chơi tiếp.")
+                    "[RECOVERY-REQUIRED] deep-check execute có lỗi; quân có "
+                    "thể còn ở ô test tạm dù carry_state="
+                    f"{self._carry_state}. Restart launch trước khi chơi tiếp.")
 
             deep_total = sum(len(v) for v in deep.values())
             for phase, items in deep.items():
@@ -1709,37 +1965,45 @@ class PickPlaceNode(Node):
             # Quân mục tiêu vẫn ở PlanningScene. ACM chỉ cho link kẹp chạm nó.
             self._set_gripper(gripper_open)
             obj_id = self._take_piece_from_world(from_sq)
-            x0, y0, z0, source_approach_z, grasp_q = self._approach_and_descend_for_grasp(
-                from_sq, piece_type, "hạ gắp", obj_id
+            (x0, y0, z0, source_approach_z, grasp_q,
+             verified) = self._approach_and_descend_for_grasp(
+                from_sq, piece_type, "hạ gắp", obj_id,
+                dest_xy=(x1, y1),
+                dest_piece_type=placed_piece_type or piece_type,
+                dest_approach_z=target_approach_z, dest_label=to_sq,
             )
             self._set_gripper(0.0)
             self._carry_state = "ATTACH_PENDING"
             self._attach_piece(obj_id, piece_type, square_to_xy(from_sq))
             self._carry_state = "ATTACHED"
-            self._move_vertical(x0, y0, source_approach_z, "nâng sau gắp", quat_xyzw=grasp_q)
-            # Quân đã thoát mặt bàn: ĐÓNG board-contact ngay (Fix 3). Giữ
-            # gripper-touch suốt lúc mang. Nếu còn mở, quân attached xuyên bàn
-            # trong transfer mà không bị chặn.
-            self._set_piece_collision(obj_id, gripper_touch=True, board_contact=False)
-
-            # Transit position-only tới tâm approach ô đích: KHÔNG ép orientation
-            # (5 DOF + IK position-only; ép quat grasp lúc gắp qua cả bàn cờ là
-            # vô nghiệm như case a1->e4). Orientation chỉ chốt ở bước hạ đặt
-            # Cartesian với yaw tối ưu bên dưới.
-            self._move_to(x1, y1, target_approach_z)
-            # Đặt bù offset gắp (Fix 2): TCP tới pose đã bù để TÂM QUÂN (không
-            # phải TCP) rơi đúng tâm ô đích; yaw quân ở đích được chọn để TCP
-            # gần nhất với quat sau transfer (quân vẫn đứng thẳng đứng vì yaw
-            # quanh trục đứng không gây nghiêng). Cartesian fail ở đây -> raise
-            # để NACK, không đặt lệch âm thầm.
-            place_tcp = self._place_tcp_for_target(
-                obj_id, (x1, y1), z1, placed_piece_type or piece_type,
-                preferred_quat=self._current_tcp_quat())
-            # Sắp chạm mặt bàn ở điểm đặt: MỞ board-contact trước khi hạ.
-            self._set_piece_collision(obj_id, gripper_touch=True, board_contact=True)
-            self._move_vertical_place(
-                place_tcp, "hạ đặt", obj_id, (x1, y1),
-                placed_piece_type or piece_type)
+            dest_piece = placed_piece_type or piece_type
+            verified_quat = (verified or {}).get("place_quat")
+            # Ưu tiên execute đúng chuỗi trajectory đã PASS precheck (giữ nhánh
+            # khớp đã FK-xác nhận; plan lại có thể lật nhánh với IK
+            # position-only như case a1->e4). Gate fail -> plan lại, execute
+            # fail -> raise (robot đã chuyển động, không fallback).
+            place_tcp, _cached_where = self._try_execute_cached_carry_chain(
+                verified, obj_id, dest_piece, (x1, y1),
+                f"pick-place {from_sq}->{to_sq}")
+            if place_tcp is None and _cached_where == "source":
+                self._move_vertical(
+                    x0, y0, source_approach_z, "nâng sau gắp",
+                    quat_xyzw=grasp_q)
+                # Quân đã thoát mặt bàn: ĐÓNG board-contact ngay (Fix 3). Giữ
+                # gripper-touch suốt lúc mang. Nếu còn mở, quân attached xuyên
+                # bàn trong transfer mà không bị chặn.
+                self._set_piece_collision(
+                    obj_id, gripper_touch=True, board_contact=False)
+                # Transit position-only tới tâm approach ô đích: KHÔNG ép
+                # orientation (5 DOF + IK position-only; ép quat grasp lúc gắp
+                # qua cả bàn cờ là vô nghiệm như case a1->e4). Orientation chỉ
+                # chốt ở bước hạ đặt Cartesian bên dưới.
+                self._move_to(x1, y1, target_approach_z)
+            if place_tcp is None:
+                # Đặt bù offset gắp bằng vòng FK → sửa XYZ tâm quân.
+                place_tcp = self._place_at_dest_compensated(
+                    obj_id, (x1, y1), z1, dest_piece, target_approach_z,
+                    verified_quat, "hạ đặt")
             self._verify_attached_piece_target(
                 obj_id, (x1, y1), placed_piece_type or piece_type,
                 requested_tcp=place_tcp)
@@ -1775,24 +2039,35 @@ class PickPlaceNode(Node):
         try:
             self._set_gripper(PIECE_SPECS[piece_type].gripper_open)
             obj_id = self._take_piece_from_world(square)
-            x0, y0, z0, source_approach_z, grasp_q = self._approach_and_descend_for_grasp(
-                square, piece_type, "hạ gắp quân bị ăn", obj_id
+            (x0, y0, z0, source_approach_z, grasp_q,
+             verified) = self._approach_and_descend_for_grasp(
+                square, piece_type, "hạ gắp quân bị ăn", obj_id,
+                dest_xy=(xd, yd), dest_piece_type=piece_type,
+                dest_approach_z=discard_tcp_z + APPROACH_HEIGHT,
+                dest_label=f"slot{slot}",
             )
             self._set_gripper(0.0)
             self._carry_state = "ATTACH_PENDING"
             self._attach_piece(obj_id, piece_type, square_to_xy(square))
             self._carry_state = "ATTACHED"
-            self._move_vertical(x0, y0, source_approach_z, "nâng quân bị ăn", quat_xyzw=grasp_q)
-            self._set_piece_collision(obj_id, gripper_touch=True, board_contact=False)
-            # Transit position-only tới khu discard (lý do như _do_pick_place:
-            # không ép orientation lúc mang), rồi hạ bù với yaw tối ưu.
-            self._move_to(xd, yd, discard_tcp_z + APPROACH_HEIGHT)
-            drop_tcp = self._place_tcp_for_target(
-                obj_id, (xd, yd), discard_tcp_z, piece_type,
-                preferred_quat=self._current_tcp_quat())
-            self._set_piece_collision(obj_id, gripper_touch=True, board_contact=True)
-            self._move_vertical_place(
-                drop_tcp, "hạ thả quân bị ăn", obj_id, (xd, yd), piece_type)
+            verified_quat = (verified or {}).get("place_quat")
+            drop_tcp, _cached_where = self._try_execute_cached_carry_chain(
+                verified, obj_id, piece_type, (xd, yd),
+                f"discard {square}->slot{slot}")
+            if drop_tcp is None and _cached_where == "source":
+                self._move_vertical(
+                    x0, y0, source_approach_z, "nâng quân bị ăn",
+                    quat_xyzw=grasp_q)
+                self._set_piece_collision(
+                    obj_id, gripper_touch=True, board_contact=False)
+                # Transit position-only tới khu discard (lý do như
+                # _do_pick_place: không ép orientation lúc mang).
+                self._move_to(xd, yd, discard_tcp_z + APPROACH_HEIGHT)
+            if drop_tcp is None:
+                drop_tcp = self._place_at_dest_compensated(
+                    obj_id, (xd, yd), discard_tcp_z, piece_type,
+                    discard_tcp_z + APPROACH_HEIGHT, verified_quat,
+                    "hạ thả quân bị ăn")
             self._verify_attached_piece_target(
                 obj_id, (xd, yd), piece_type, requested_tcp=drop_tcp)
             self._set_gripper(PIECE_SPECS[piece_type].gripper_open)
@@ -1833,7 +2108,9 @@ class PickPlaceNode(Node):
                 yield offset
 
     def _approach_and_descend_for_grasp(self, square, piece_type, step_name,
-                                        source_obj_id=None):
+                                        source_obj_id=None,
+                                        dest_xy=None, dest_piece_type=None,
+                                        dest_approach_z=None, dest_label=None):
         """Tìm offset gắp an toàn bằng chính pipeline OMPL -> Cartesian runtime.
 
         Mỗi candidate đều được collision-check. Candidate thất bại ở approach
@@ -1842,6 +2119,19 @@ class PickPlaceNode(Node):
         mang (proxy scratch attached ở đúng TCP sau descend) — trước đây chọn
         ngay khi descend xong nên lift/place vẫn có thể rớt sau attach. Thêm
         điều kiện hình học offset tối đa và trần tổng thời gian tìm kiếm.
+
+        Fix 7 (tìm nghiệm gắp–đặt trước attach): nếu có dest_xy, mỗi offset
+        phải PASS toàn chuỗi lift → transfer → pre-place/descend từng yaw với
+        MỘT scratch session giữ đúng T_tcp_piece giả định (đo tại TF descend
+        hiện tại) và start plan nối chuỗi, không di chuyển robot. IK
+        position-only có thể bỏ qua quaternion yêu cầu nên chỉ chốt offset khi
+        tồn tại candidate đưa tâm quân vào sai số 5 mm ở FK endpoint. Góc quân
+        không còn là điều kiện PASS/NACK. Nghiệm candidate
+        đã PASS (gồm chính các trajectory) được trả thẳng cho runtime trong
+        cùng thao tác. Nếu vẫn rớt khi đã ATTACHED thì giữ hành vi dừng an
+        toàn (không đổi offset khi đang mang). Không truyền dest_xy (=None)
+        thì chỉ check lift.
+        Trả về (x, y, z, approach_z, grasp_q, verified|None).
         """
         # Runtime đã pop mapping ô nguồn trước khi gọi hàm này. Giữ ID nguồn
         # tường minh để proxy lift thay đúng CollisionObject; nếu không có
@@ -1864,6 +2154,9 @@ class PickPlaceNode(Node):
                 continue
             x, y, z = square_to_grasp_pose(square, piece_type, offset)
             approach_z = approach_tcp_z(square, z)
+            # Lift Cartesian chỉ đủ để tách quân khỏi mặt bàn. Từ đây tới đích
+            # là chuyển động xa và được OMPL position-only xử lý.
+            lift_z = min(approach_z, z + CARRY_CLEARANCE_LIFT_M)
             approach_trajectory = self._plan_motion(
                 position=[x, y, approach_z], target_link=END_EFFECTOR,
                 tolerance_position=0.004, cartesian=False)
@@ -1885,30 +2178,78 @@ class PickPlaceNode(Node):
                 )
                 continue
             self._execute_and_wait(self.moveit2, descend_trajectory)
-            # Validate lift CÓ mang trước khi kẹp thật: gắn proxy scratch đúng
-            # TCP hiện tại, plan nâng, gỡ proxy. Kẹp vẫn mở, chưa attach gì.
-            scratch = None
+            # T_tcp_piece giả định của đúng offset đang thử, đo tại TF descend
+            # hiện tại (kẹp vẫn mở, chưa attach gì). Mọi precheck có mang bên
+            # dưới dùng đúng transform này.
             source_xyz = (*square_to_xy(square), BOARD_Z)
             try:
-                scratch = self._dry_attach_scratch(
-                    piece_type, square_to_xy(square), source_obj_id)
-                lift_trajectory = self._plan_vertical_trajectory(
-                    x, y, approach_z, grasp_q, f"{step_name}/lift-validate")
-            finally:
-                self._dry_detach_scratch(
-                    scratch or "__dry_carry__", source_obj_id, source_xyz, piece_type)
-            if lift_trajectory is None:
-                errors.append(f"{offset}: Cartesian lift fail (có mang)")
+                hypo_local = self._piece_local_pose(
+                    piece_type, square_to_xy(square))
+            except Exception as exc:
+                errors.append(f"{offset}: không đo được T_tcp_piece ({exc})")
                 self.get_logger().warning(
                     f"[GRASP-CANDIDATE] {square} thử {index} offset={offset}: "
-                    f"descend được nhưng lift có mang fail -> loại"
-                )
+                    f"không đo TF để validate mang ({exc}) -> loại")
                 continue
+            if dest_xy is None:
+                # Không có đích (helper gọi độc lập): chỉ check lift có mang
+                # với đúng transform, như Fix 6 nhưng pose tường minh.
+                scratch = None
+                try:
+                    scratch = self._dry_attach_scratch_with_local(
+                        hypo_local, piece_type, source_obj_id)
+                    lift_trajectory = self._plan_vertical_trajectory(
+                        x, y, lift_z, grasp_q, f"{step_name}/lift-validate")
+                except Exception as exc:
+                    errors.append(f"{offset}: scratch/lift lỗi ({exc})")
+                    lift_trajectory = None
+                finally:
+                    self._dry_detach_scratch(
+                        scratch or "__dry_carry__", source_obj_id,
+                        source_xyz, piece_type)
+                if lift_trajectory is None:
+                    errors.append(f"{offset}: Cartesian lift fail (có mang)")
+                    self.get_logger().warning(
+                        f"[GRASP-CANDIDATE] {square} thử {index} offset={offset}: "
+                        f"descend được nhưng lift có mang fail -> loại"
+                    )
+                    continue
+                verified = None
+            else:
+                # Fix 7 đầy đủ: MỘT scratch session giữ đúng transform xuyên
+                # suốt lift → transfer → pre-place/descend từng yaw. Robot
+                # không di chuyển (toàn plan-only với start nối chuỗi).
+                verified = self._validate_carry_chain_for_offset(
+                    hypo_local, piece_type,
+                    dest_piece_type or piece_type,
+                    (x, y, z), lift_z, grasp_q,
+                    dest_xy, dest_approach_z,
+                    source_obj_id, source_xyz,
+                    context=f"{square}->{dest_label or dest_xy}/offset{offset}")
+                if verified is None:
+                    chain_reason = getattr(
+                        self, "_last_chain_failure_reason",
+                        "chuỗi mang không có nghiệm")
+                    errors.append(
+                        f"{offset}: {chain_reason} tại {dest_label or dest_xy}")
+                    self.get_logger().warning(
+                        f"[GRASP-CANDIDATE] {square} thử {index} offset={offset}: "
+                        f"chuỗi mang fail ({chain_reason}) -> loại")
+                    continue
             self._grasp_offset_cache[square] = offset
-            self.get_logger().info(
-                f"[GRASP-CANDIDATE] {square} chọn offset={offset} sau {index} lần thử"
-            )
-            return x, y, z, approach_z, grasp_q
+            if verified is not None:
+                self.get_logger().info(
+                    f"[GRASP-CANDIDATE] {square} chọn offset={offset} "
+                    f"+ nghiệm đặt bù tâm sau {index} lần thử "
+                    f"(lệch {verified['pos_err'] * 1000:.1f}mm "
+                    f"tilt {math.degrees(verified['tilt']):.1f}° ở precheck)"
+                )
+            else:
+                self.get_logger().info(
+                    f"[GRASP-CANDIDATE] {square} chọn offset={offset} "
+                    f"sau {index} lần thử"
+                )
+            return x, y, z, lift_z, grasp_q, verified
         raise RuntimeError(
             f"Không có approach gắp an toàn cho {square} sau {len(errors)} candidate; "
             f"candidate cuối: {errors[-1] if errors else 'none'}"
@@ -1925,17 +2266,48 @@ class PickPlaceNode(Node):
                 raise RuntimeError("Không nhận được joint_states")
             time.sleep(0.01)
 
-    def _plan_motion(self, **kwargs):
+    def _joint_state_from_trajectory_end(self, trajectory):
+        """Dựng JointState tại điểm cuối trajectory để chain plan kế tiếp.
+
+        plan_async chấp nhận start tùy ý (cả OMPL lẫn Cartesian đều đọc
+        start_state này), nhờ vậy precheck nối lift → transfer → descend đúng
+        thứ tự mà không cần di chuyển robot thật. Merge theo tên joint để giữ
+        các joint ngoài trajectory (không bao giờ rỗng một phần).
+        """
+        last = trajectory.points[-1]
+        base = copy.deepcopy(self.moveit2.joint_state)
+        if base is None:
+            raise RuntimeError("thiếu joint state hiện tại để chain plan")
+        pos = dict(zip(base.name, base.position))
+        names = list(trajectory.joint_names)
+        if len(names) != len(last.positions):
+            raise RuntimeError(
+                f"trajectory joint_names ({len(names)}) lệch positions "
+                f"({len(last.positions)}) khi chain plan")
+        for n, p in zip(names, last.positions):
+            if not math.isfinite(float(p)):
+                raise RuntimeError(f"trajectory endpoint NaN/inf tại {n}")
+            pos[n] = float(p)
+        merged = JointState()
+        merged.name = list(base.name)
+        merged.position = [pos[n] for n in base.name]
+        return merged
+
+    def _plan_motion(self, _start_joint_state=None, **kwargs):
         """Phiên bản non-spinning của pymoveit2.plan().
 
         pymoveit2.plan() tự gọi rclpy.spin_once(), điều này không hợp lệ khi
         node đã chạy trong MultiThreadedExecutor và dẫn tới lỗi wait-set.
+        _start_joint_state: JointState tùy ý để chain plan (mặc định = state
+        hiện tại). Cả OMPL lẫn Cartesian đều tôn trọng start này.
         """
         self._wait_for_joint_state(self.moveit2)
         cartesian = kwargs.get("cartesian", False)
         fraction_threshold = kwargs.pop("cartesian_fraction_threshold", 0.0)
+        start = (_start_joint_state if _start_joint_state is not None
+                 else self.moveit2.joint_state)
         future = self.moveit2.plan_async(
-            start_joint_state=self.moveit2.joint_state, **kwargs
+            start_joint_state=start, **kwargs
         )
         if future is None:
             return None
@@ -2042,7 +2414,8 @@ class PickPlaceNode(Node):
         except Exception as exc:
             raise RuntimeError(f"Không đọc được TF {BASE_LINK}->{END_EFFECTOR}: {exc}")
         q = transform.transform.rotation
-        return [q.x, q.y, q.z, q.w]
+        qn = self._normalize_quaternion((q.x, q.y, q.z, q.w))
+        return [qn[0], qn[1], qn[2], qn[3]]
 
     def _fk_tcp_pose(self, joint_names, joint_positions):
         """FK qua /compute_fk ra pose TCP (xyz + quat). Fail-closed: service
@@ -2073,32 +2446,269 @@ class PickPlaceNode(Node):
         return ((p.position.x, p.position.y, p.position.z),
                 (p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w))
 
-    def _validate_place_trajectory_end(self, trajectory, obj_id: str, target_xy,
-                                       piece_type: str, requested_tcp, step_name: str):
-        """Dùng FK kiểm tra ĐIỂM CUỐI trajectory hạ đặt TRƯỚC execute.
-
-        IK position-only có thể thực hiện orientation khác với quat đã dùng để
-        tính bù TCP: dù TCP tới đúng XYZ thì tâm quân vẫn lệch. FK điểm cuối +
-        T_tcp_piece cho tâm quân và độ nghiêng THỰC SẼ ĐẠT; không đạt ngưỡng
-        (5 mm / 5°) thì raise kèm đủ pose để phân biệt lỗi IK, transform hay TF.
-        """
-        last = trajectory.points[-1]
-        (fx, fy, fz), fq = self._fk_tcp_pose(trajectory.joint_names, last.positions)
-        local = self._grasp_local_by_id.get(obj_id)
-        if local is None:
-            raise RuntimeError(f"thiếu T_tcp_piece của {obj_id} khi FK-validate {step_name}")
+    def _piece_error_from_tcp(self, tcp_xyz, tcp_quat, local: Pose,
+                              target_xy, piece_type: str):
+        """Tính (position_error, tilt, center, q_piece) của quân từ pose TCP."""
         pl = (local.position.x, local.position.y, local.position.z)
-        ql = (local.orientation.x, local.orientation.y,
-              local.orientation.z, local.orientation.w)
+        ql = self._normalize_quaternion(
+            (local.orientation.x, local.orientation.y,
+             local.orientation.z, local.orientation.w))
+        fq = self._normalize_quaternion(tuple(tcp_quat))
         rx, ry, rz = self._rotate_by_quaternion(pl, fq)
-        center = (fx + rx, fy + ry, fz + rz)
+        center = (tcp_xyz[0] + rx, tcp_xyz[1] + ry, tcp_xyz[2] + rz)
         spec = PIECE_SPECS[piece_type]
         want = (target_xy[0], target_xy[1], BOARD_Z + spec.pickup_height / 2)
         position_error = math.sqrt(sum(
             (got - w) ** 2 for got, w in zip(center, want)))
         q_piece = self._multiply_quaternions(fq, ql)
         tilt = self._tilt_from_quaternion(q_piece)
-        if position_error <= 0.005 and tilt <= math.radians(5.0):
+        return position_error, tilt, center, q_piece
+
+    def _compensate_place_tcp(self, place_tcp, center, target_xy,
+                              piece_type: str):
+        """Dịch XYZ TCP theo sai số tâm quân FK; không thay quaternion.
+
+        IK position-only có thể chọn orientation khác q yêu cầu, nhưng log thực
+        tế cho thấy XYZ TCP vẫn đạt chính xác. Vì vậy dùng sai số tâm quân làm
+        bước fixed-point correction. Giới hạn mỗi bước để một TF/transform lỗi
+        không đẩy target quá xa trong một lần.
+        """
+        want = (
+            target_xy[0], target_xy[1],
+            BOARD_Z + PIECE_SPECS[piece_type].pickup_height / 2)
+        delta = [want[i] - center[i] for i in range(3)]
+        length = math.sqrt(sum(v * v for v in delta))
+        if not math.isfinite(length):
+            raise RuntimeError("sai số bù tâm quân là NaN/inf")
+        if length > PLACE_COMPENSATION_MAX_STEP_M:
+            scale = PLACE_COMPENSATION_MAX_STEP_M / length
+            delta = [v * scale for v in delta]
+        return (
+            float(place_tcp[0]) + delta[0],
+            float(place_tcp[1]) + delta[1],
+            float(place_tcp[2]) + delta[2],
+            place_tcp[3],
+        )
+
+    def _plan_quiet(self, context: str, **kwargs):
+        """Plan trả None khi fail thay vì raise — precheck thử nghiệm kế.
+
+        _plan_motion raise ở timeout; Cartesian fail trả None. Chuẩn hoá cả hai
+        thành None để một plan flake không đánh sập cả vòng tìm offset.
+        """
+        try:
+            return self._plan_motion(**kwargs)
+        except Exception as exc:
+            self.get_logger().warning(f"[CHAIN] {context}: plan lỗi ({exc})")
+            return None
+
+    def _validate_carry_chain_for_offset(
+            self, hypo_local: Pose, piece_type: str, dest_piece_type: str,
+            grasp_xyz, grasp_approach_z: float, grasp_q,
+            target_xy, target_approach_z: float,
+            source_obj_id: str | None, source_xyz, context: str,
+            yaw_count: int = PLACE_YAW_COUNT):
+        """Kiểm tra TOÀN CHUỖI mang trước khi gắp thật, với đúng thể tích quân.
+
+        Một scratch session duy nhất giữ T_tcp_piece giả định của đúng offset
+        đang thử xuyên suốt: lift Cartesian (từ pose descend hiện tại) →
+        transfer position-only tới approach đích (start nối từ cuối lift) →
+        pre-place bù bằng OMPL position-only (được đổi nhánh khớp) →
+        descend Cartesian (start nối từ cuối pre-place) → FK endpoint.
+        Chỉ chốt offset khi tồn tại nghiệm đưa tâm quân vào sai số 5 mm;
+        orientation của quân chỉ ghi log, không dùng làm điều kiện loại.
+
+        Attach scratch fail → None (FAIL kiểm tra transfer, KHÔNG fallback
+        IK-only rồi PASS). Mọi plan trong chuỗi đều có mang (scratch attached).
+        Robot không hề di chuyển (toàn plan-only). Trả về dict nghiệm gồm cả
+        toàn bộ trajectory đã PASS {lift, transfer, pre, desc, hypo_local,
+        scene_fingerprint, place_tcp, place_quat, pos_err, tilt}
+        để runtime
+        execute đúng nhánh khớp đã FK-xác nhận thay vì plan lại (OMPL ngẫu
+        nhiên có thể lật sang nhánh khác với IK position-only) — hoặc None.
+        """
+        self._last_chain_failure_reason = "chuỗi mang không có nghiệm"
+        scratch_id = None
+        try:
+            scratch_id = self._dry_attach_scratch_with_local(
+                hypo_local, piece_type, source_obj_id)
+        except Exception as exc:
+            self._last_chain_failure_reason = f"attach scratch lỗi: {exc}"
+            self.get_logger().warning(
+                f"[CHAIN] {context}: không attach scratch đúng transform "
+                f"({exc}) -> loại offset (không coi là PASS)")
+            try:
+                self._dry_detach_scratch(
+                    scratch_id or "__dry_carry__", source_obj_id,
+                    source_xyz, piece_type)
+            except Exception:
+                pass
+            return None
+        try:
+            # Snapshot pose + geometry + attached khác + ACM đúng lúc chuỗi
+            # được kiểm tra. Scratch/quân nguồn được loại và được gate riêng
+            # bằng T_tcp_piece, nên hai scene trước/sau attach so sánh được.
+            try:
+                scene_fingerprint = self._scene_cache_fingerprint(source_obj_id)
+            except Exception as exc:
+                self._last_chain_failure_reason = f"snapshot scene lỗi: {exc}"
+                self.get_logger().warning(
+                    f"[CHAIN] {context}: không đọc scene làm baseline "
+                    f"({exc}) -> loại offset")
+                return None
+            # Lift giữ orientation lúc gắp; start = pose descend thật của robot.
+            # Timeout plan raise -> chuẩn hoá thành None (loại offset này).
+            try:
+                lift = self._plan_vertical_trajectory(
+                    grasp_xyz[0], grasp_xyz[1], grasp_approach_z, grasp_q,
+                    f"{context}/lift")
+            except Exception as exc:
+                self._last_chain_failure_reason = f"lift plan lỗi: {exc}"
+                self.get_logger().warning(
+                    f"[CHAIN] {context}: lift plan lỗi ({exc}) -> loại offset")
+                return None
+            if lift is None:
+                self._last_chain_failure_reason = "Cartesian clearance lift có mang fail"
+                self.get_logger().warning(
+                    f"[CHAIN] {context}: lift có mang fail -> loại offset")
+                return None
+            try:
+                lift_end = self._joint_state_from_trajectory_end(lift)
+            except Exception as exc:
+                self._last_chain_failure_reason = f"endpoint lift xấu: {exc}"
+                self.get_logger().warning(
+                    f"[CHAIN] {context}: endpoint lift xấu ({exc}) -> loại")
+                return None
+            transfer = self._plan_quiet(
+                f"{context}/transfer",
+                _start_joint_state=lift_end,
+                position=[target_xy[0], target_xy[1], target_approach_z],
+                target_link=END_EFFECTOR, tolerance_position=0.004,
+                cartesian=False)
+            if transfer is None:
+                self._last_chain_failure_reason = "OMPL transfer có mang fail"
+                self.get_logger().warning(
+                    f"[CHAIN] {context}: transfer có mang không plan được "
+                    f"-> loại offset")
+                return None
+            try:
+                transfer_end = self._joint_state_from_trajectory_end(transfer)
+            except Exception as exc:
+                self._last_chain_failure_reason = f"endpoint transfer xấu: {exc}"
+                self.get_logger().warning(
+                    f"[CHAIN] {context}: endpoint transfer xấu ({exc}) -> loại")
+                return None
+            yaw_cands = self._place_yaw_candidates_for_local(
+                hypo_local, target_xy, dest_piece_type, grasp_q, yaw_count)
+            for place_tcp, _k, _psi in yaw_cands:
+                for correction in range(PLACE_COMPENSATION_MAX_ITERATIONS):
+                    px, py, pz, pq = (place_tcp[0], place_tcp[1],
+                                      place_tcp[2], place_tcp[3])
+                    label = f"{context}/comp{correction + 1}"
+                    # Plan-only từ đúng cuối transfer ở mọi vòng; arm chưa di
+                    # chuyển. Quaternion chỉ là seed API, không phải điều kiện
+                    # PASS. XYZ được sửa theo tâm quân FK của vòng trước.
+                    pre = self._plan_quiet(
+                        f"{label}/pre-place",
+                        _start_joint_state=transfer_end,
+                        position=[px, py, target_approach_z],
+                        target_link=END_EFFECTOR,
+                        tolerance_position=0.002, cartesian=False)
+                    if pre is None:
+                        break
+                    try:
+                        pre_end = self._joint_state_from_trajectory_end(pre)
+                        pre_last = pre.points[-1]
+                        _pre_xyz, pre_q = self._fk_tcp_pose(
+                            pre.joint_names, pre_last.positions)
+                    except Exception:
+                        break
+                    try:
+                        self._set_piece_collision(
+                            scratch_id, gripper_touch=True, board_contact=True)
+                        desc = self._plan_quiet(
+                            f"{label}/descend",
+                            _start_joint_state=pre_end,
+                            position=[px, py, pz], quat_xyzw=pre_q,
+                            target_link=END_EFFECTOR,
+                            tolerance_position=0.002,
+                            tolerance_orientation=0.03,
+                            cartesian=True, max_step=0.002,
+                            cartesian_fraction_threshold=0.999)
+                    finally:
+                        self._set_piece_collision(
+                            scratch_id, gripper_touch=True,
+                            board_contact=False)
+                    if desc is None:
+                        break
+                    try:
+                        last = desc.points[-1]
+                        (fx, fy, fz), fq = self._fk_tcp_pose(
+                            desc.joint_names, last.positions)
+                        pos_err, tilt, center, _q = self._piece_error_from_tcp(
+                            (fx, fy, fz), fq, hypo_local,
+                            target_xy, dest_piece_type)
+                    except Exception:
+                        break
+                    if pos_err <= PLACE_POSITION_TOL_M:
+                        # Quaternion thực tế của endpoint, chỉ dùng để retreat
+                        # giữ pose hiện tại; không phải constraint của quân.
+                        place_tcp = (px, py, pz, fq)
+                        self.get_logger().info(
+                            f"[CHAIN] {context}: bù tâm FK đạt sau "
+                            f"{correction + 1}/{PLACE_COMPENSATION_MAX_ITERATIONS} "
+                            f"lần, lệch {pos_err * 1000:.1f}mm; "
+                            f"tilt tham khảo {math.degrees(tilt):.1f}°")
+                        return {"lift": lift, "transfer": transfer,
+                                "pre": pre, "desc": desc,
+                                "hypo_local": copy.deepcopy(hypo_local),
+                                "scene_fingerprint": scene_fingerprint,
+                                "place_tcp": place_tcp, "place_quat": fq,
+                                "pos_err": pos_err, "tilt": tilt}
+                    corrected = self._compensate_place_tcp(
+                        place_tcp, center, target_xy, dest_piece_type)
+                    self.get_logger().info(
+                        f"[PLACE-COMP] {label}: tâm lệch "
+                        f"{pos_err * 1000:.1f}mm -> dịch TCP "
+                        f"({(corrected[0] - px) * 1000:.1f}, "
+                        f"{(corrected[1] - py) * 1000:.1f}, "
+                        f"{(corrected[2] - pz) * 1000:.1f})mm")
+                    place_tcp = corrected
+            self.get_logger().warning(
+                f"[CHAIN] {context}: lift + transfer đạt nhưng bù tâm FK "
+                f"không hội tụ sau {PLACE_COMPENSATION_MAX_ITERATIONS} lần "
+                f"-> loại offset")
+            self._last_chain_failure_reason = (
+                "bù tâm FK/pre-place→descend không hội tụ sau "
+                f"{PLACE_COMPENSATION_MAX_ITERATIONS} lần")
+            return None
+        finally:
+            self._dry_detach_scratch(
+                scratch_id or "__dry_carry__", source_obj_id,
+                source_xyz, piece_type)
+
+    def _validate_place_trajectory_end(self, trajectory, obj_id: str, target_xy,
+                                       piece_type: str, requested_tcp, step_name: str,
+                                       local_override=None):
+        """Dùng FK kiểm tra ĐIỂM CUỐI trajectory hạ đặt TRƯỚC execute.
+
+        IK position-only có thể thực hiện orientation khác với quat đã dùng để
+        tính bù TCP: dù TCP tới đúng XYZ thì tâm quân vẫn lệch. FK điểm cuối +
+        T_tcp_piece cho tâm quân THỰC SẼ ĐẠT; tâm lệch quá 5 mm thì raise.
+        Góc nghiêng vẫn được log để chẩn đoán nhưng không làm thao tác FAIL.
+        local_override: T_tcp_piece giả định (validate trước attach).
+        """
+        last = trajectory.points[-1]
+        (fx, fy, fz), fq = self._fk_tcp_pose(trajectory.joint_names, last.positions)
+        local = local_override if local_override is not None else \
+            self._grasp_local_by_id.get(obj_id)
+        if local is None:
+            raise RuntimeError(f"thiếu T_tcp_piece của {obj_id} khi FK-validate {step_name}")
+        position_error, tilt, center, _q_piece = self._piece_error_from_tcp(
+            (fx, fy, fz), fq, local, target_xy, piece_type)
+        want = (target_xy[0], target_xy[1],
+                BOARD_Z + PIECE_SPECS[piece_type].pickup_height / 2)
+        if position_error <= PLACE_POSITION_TOL_M:
             return
         raise RuntimeError(
             f"FK cuối trajectory {step_name} không đạt pose đặt: "
@@ -2107,8 +2717,9 @@ class PickPlaceNode(Node):
             f"TCP FK xyz={[round(v, 4) for v in (fx, fy, fz)]} "
             f"quat={[round(v, 3) for v in fq]}; "
             f"tâm quân FK={[round(v, 4) for v in center]} muốn={want} "
-            f"(lệch {position_error:.4f}m), nghiêng (bỏ yaw)={math.degrees(tilt):.1f}deg. "
-            f"Khả năng: IK position-only thực hiện orientation khác quat tính bù.")
+            f"(lệch {position_error:.4f}m); góc nghiêng tham khảo "
+            f"(không dùng để FAIL)={math.degrees(tilt):.1f}deg. "
+            f"Khả năng: TCP compensation chưa khớp orientation FK thực tế.")
 
     def _move_vertical(self, x, y, z, step_name: str, quat_xyzw=None):
         """Đi thẳng đứng bằng compute_cartesian_path, không để OMPL lách qua
@@ -2149,23 +2760,490 @@ class PickPlaceNode(Node):
         return trajectory
 
     def _move_vertical_place(self, place_tcp, step_name: str, obj_id: str,
-                             target_xy, piece_type: str):
+                             target_xy, piece_type: str, approach_z=None):
         """Hạ đặt: plan -> FK-validate điểm cuối (tâm quân + nghiêng) -> execute.
 
         Không đạt thì raise TRƯỚC khi arm nhúc nhích: caller loại candidate /
-        NACK thay vì đặt lệch rồi mới phát hiện ở _verify.
+        NACK thay vì đặt lệch rồi mới phát hiện ở _verify. Giữ wrapper cho
+        caller cũ; flow mới dùng compensation lặp theo FK.
         """
-        trajectory = self._plan_vertical_or_raise(
-            *place_tcp[:3], place_tcp[3], step_name)
-        if trajectory is None:
+        if approach_z is None:
+            # Legacy: descend trực tiếp, caller tự quản ACM.
+            trajectory = self._plan_vertical_or_raise(
+                *place_tcp[:3], place_tcp[3], step_name)
+            if trajectory is None:
+                self.get_logger().warning(
+                    f"Cartesian không đủ tại {step_name}; dùng position-only "
+                    f"fallback tới {place_tcp[:3]}")
+                self._move_to(*place_tcp[:3])
+                return place_tcp
+            self._validate_place_trajectory_end(
+                trajectory, obj_id, target_xy, piece_type, place_tcp,
+                step_name)
+            self._execute_and_wait(self.moveit2, trajectory)
+            return place_tcp
+        chosen = self._move_vertical_place_compensated(
+            [place_tcp], step_name, obj_id, target_xy, piece_type, approach_z)
+        return chosen
+
+    def _trajectory_start_close(self, trajectory, context: str,
+                                  tol: float = CACHED_CHAIN_JOINT_TOL_RAD) -> bool:
+        """Arm hiện tại có đang đứng đúng start của trajectory cached không."""
+        try:
+            self._wait_for_joint_state(self.moveit2, timeout_sec=3.0)
+            cur = dict(zip(self.moveit2.joint_state.name,
+                           self.moveit2.joint_state.position))
+        except Exception as exc:
             self.get_logger().warning(
-                f"Cartesian không đủ tại {step_name}; dùng position-only fallback tới {place_tcp[:3]}"
-            )
-            self._move_to(*place_tcp[:3])
-            return
-        self._validate_place_trajectory_end(
-            trajectory, obj_id, target_xy, piece_type, place_tcp, step_name)
-        self._execute_and_wait(self.moveit2, trajectory)
+                f"[CACHED] {context}: không đọc joint hiện tại ({exc})")
+            return False
+        names = list(trajectory.joint_names)
+        pts = trajectory.points[0].positions if trajectory.points else []
+        if len(names) != len(pts) or not names:
+            self.get_logger().warning(
+                f"[CACHED] {context}: trajectory cached rỗng/lệch")
+            return False
+        worst = 0.0
+        for n, p in zip(names, pts):
+            if n not in cur or not math.isfinite(float(p)):
+                return False
+            delta = math.atan2(
+                math.sin(float(cur[n]) - float(p)),
+                math.cos(float(cur[n]) - float(p)))
+            worst = max(worst, abs(delta))
+        if worst > tol:
+            self.get_logger().warning(
+                f"[CACHED] {context}: arm lệch start cached "
+                f"{math.degrees(worst):.2f}° > {math.degrees(tol):.2f}°")
+            return False
+        return True
+
+    @staticmethod
+    def _trajectory_boundary_close(first, second,
+                                   tol: float = CACHED_CHAIN_JOINT_TOL_RAD) -> bool:
+        """Endpoint trajectory trước có nối đúng start trajectory sau không."""
+        if (first is None or second is None or not first.points
+                or not second.points):
+            return False
+        end = dict(zip(first.joint_names, first.points[-1].positions))
+        start = dict(zip(second.joint_names, second.points[0].positions))
+        required = set(JOINT_NAMES)
+        if not required.issubset(end) or not required.issubset(start):
+            return False
+        common = set(end) & set(start)
+        if not common:
+            return False
+        for name in common:
+            a, b = float(end[name]), float(start[name])
+            if not (math.isfinite(a) and math.isfinite(b)):
+                return False
+            delta = math.atan2(math.sin(a - b), math.cos(a - b))
+            if abs(delta) > tol:
+                return False
+        return True
+
+    def _joint_state_for_positions(self, names, positions) -> JointState:
+        """Merge waypoint arm vào joint state hiện tại (giữ gripper thật)."""
+        self._wait_for_joint_state(self.moveit2, timeout_sec=3.0)
+        state = copy.deepcopy(self.moveit2.joint_state)
+        values = dict(zip(state.name, state.position))
+        if len(names) != len(positions):
+            raise RuntimeError("joint_names/positions lệch khi validate cached")
+        for name, value in zip(names, positions):
+            value = float(value)
+            if not math.isfinite(value):
+                raise RuntimeError(f"waypoint cached NaN/inf tại {name}")
+            values[name] = value
+        missing = [name for name in state.name if name not in values]
+        if missing:
+            raise RuntimeError(f"joint state cached thiếu {missing}")
+        state.position = [float(values[name]) for name in state.name]
+        return state
+
+    def _cached_state_valid(self, state: JointState, context: str) -> bool:
+        """State-validity fail-closed và giữ attached object từ scene."""
+        if not self._state_validity_client.service_is_ready():
+            self.get_logger().warning(
+                f"[CACHED] {context}: /check_state_validity chưa sẵn sàng")
+            return False
+        request = GetStateValidity.Request()
+        request.group_name = GROUP_NAME
+        request.robot_state = RobotState()
+        request.robot_state.joint_state = state
+        request.robot_state.is_diff = True
+        future = self._state_validity_client.call_async(request)
+        deadline = time.monotonic() + 3.0
+        while not future.done():
+            if time.monotonic() >= deadline:
+                self.get_logger().warning(
+                    f"[CACHED] {context}: /check_state_validity timeout")
+                return False
+            time.sleep(0.01)
+        result = future.result()
+        if result is None:
+            self.get_logger().warning(
+                f"[CACHED] {context}: /check_state_validity không phản hồi")
+            return False
+        if result.valid:
+            return True
+        contacts = sorted({
+            f"{c.contact_body_1}<->{c.contact_body_2}" for c in result.contacts
+        })
+        self.get_logger().warning(
+            f"[CACHED] {context}: waypoint collision"
+            + (f" ({', '.join(contacts)})" if contacts else ""))
+        return False
+
+    def _cached_trajectory_collision_free(self, trajectory,
+                                          context: str) -> bool:
+        """Revalidate toàn đường cached với quân thật và gripper hiện tại.
+
+        Planner đã kiểm scratch, nhưng T_tcp_piece thật được phép sai khác nhỏ.
+        Vì vậy nội suy lại từng đoạn và hỏi PlanningScene hiện tại trước execute.
+        """
+        if trajectory is None or not trajectory.points:
+            self.get_logger().warning(
+                f"[CACHED] {context}: trajectory rỗng khi revalidate collision")
+            return False
+        names = list(trajectory.joint_names)
+        previous = None
+        sample_index = 0
+        for point in trajectory.points:
+            current = [float(v) for v in point.positions]
+            if len(current) != len(names):
+                return False
+            if previous is None:
+                samples = [current]
+            else:
+                max_delta = max(
+                    (abs(b - a) for a, b in zip(previous, current)),
+                    default=0.0)
+                steps = max(1, int(math.ceil(
+                    max_delta / CACHED_COLLISION_SAMPLE_RAD)))
+                samples = [
+                    [a + (b - a) * (i / steps)
+                     for a, b in zip(previous, current)]
+                    for i in range(1, steps + 1)
+                ]
+            for sample in samples:
+                try:
+                    state = self._joint_state_for_positions(names, sample)
+                except Exception as exc:
+                    self.get_logger().warning(
+                        f"[CACHED] {context}: waypoint xấu ({exc})")
+                    return False
+                if not self._cached_state_valid(
+                        state, f"{context}/sample{sample_index}"):
+                    return False
+                sample_index += 1
+            previous = current
+        return True
+
+    def _real_local_close_to_hypo(self, obj_id: str, hypo_local: Pose,
+                                  context: str):
+        """Trả pose attached MoveIt nếu gần giả định precheck, ngược lại None.
+
+        Đây là transform thật trong PlanningScene, không phải phép đo trượt
+        quân vật lý. Khi có camera, pose quan sát sau grasp phải thay/bổ sung
+        gate này.
+        """
+        try:
+            real = self._attached_piece_local_pose(obj_id)
+        except Exception as exc:
+            self.get_logger().warning(
+                f"[CACHED] {context}: không đọc được attached pose ({exc})")
+            return None
+        if hypo_local is None:
+            self.get_logger().warning(
+                f"[CACHED] {context}: thiếu T_tcp_piece thật/giả định")
+            return None
+        try:
+            dp = math.sqrt(
+                (real.position.x - hypo_local.position.x) ** 2
+                + (real.position.y - hypo_local.position.y) ** 2
+                + (real.position.z - hypo_local.position.z) ** 2)
+            dq = self._quat_angle(
+                self._normalize_quaternion(
+                    (real.orientation.x, real.orientation.y,
+                     real.orientation.z, real.orientation.w)),
+                self._normalize_quaternion(
+                    (hypo_local.orientation.x, hypo_local.orientation.y,
+                     hypo_local.orientation.z, hypo_local.orientation.w)))
+        except ValueError as exc:
+            self.get_logger().warning(
+                f"[CACHED] {context}: quaternion local xấu ({exc})")
+            return None
+        if dp > CACHED_LOCAL_POS_TOL_M or dq > math.radians(
+                CACHED_LOCAL_ANG_TOL_DEG):
+            self.get_logger().warning(
+                f"[CACHED] {context}: local thật lệch giả định "
+                f"({dp * 1000:.1f}mm, {math.degrees(dq):.1f}°) -> plan lại")
+            return None
+        return real
+
+    def _place_at_dest_compensated(self, obj_id: str, target_xy, tcp_z: float,
+                                   piece_type: str, approach_z: float,
+                                   verified_quat, step_name: str):
+        """Hạ đặt tại đích bằng FK → bù sai số tâm TCP lặp."""
+        candidates = self._place_tcp_candidates_for_target(
+            obj_id, target_xy, tcp_z, piece_type,
+            preferred_quat=self._current_tcp_quat(),
+            verified_quat=verified_quat)
+        return self._move_vertical_place_compensated(
+            candidates, step_name, obj_id, target_xy, piece_type, approach_z)
+
+    def _try_execute_cached_carry_chain(self, verified, obj_id: str,
+                                       dest_piece_type: str, target_xy,
+                                       label: str):
+        """Execute đúng chuỗi trajectory đã PASS precheck (giữ nhánh khớp).
+
+        OMPL ngẫu nhiên + IK position-only: plan lại có thể lật sang nhánh khớp
+        khác (cùng XYZ, orientation khác) như log a1->e4 đã chứng minh. Hàm này
+        tái dùng lift/transfer/pre/desc đã FK-xác nhận, sau khi qua các gate:
+        đủ trajectory, arm đúng start lift, local thật gần hypo, scene không
+        đổi, endpoint descend (với local THẬT) vẫn đưa tâm quân đúng 5 mm.
+
+        Trả về (place_tcp, where): ("done", place đã execute) | (None,
+        "source") chưa hề di chuyển -> caller plan lại toàn bộ | (None,
+        "dest") đã mang tới đích -> caller chỉ plan lại đoạn đặt. Execute fail
+        (robot đã chuyển động) thì raise, không fallback.
+        """
+        def _fallback(where: str, reason: str):
+            self.get_logger().warning(f"[CACHED] {label}: {reason} -> plan lại")
+            return None, where
+
+        if not isinstance(verified, dict):
+            return _fallback("source", "không có nghiệm cached")
+        lift = verified.get("lift")
+        transfer = verified.get("transfer")
+        pre = verified.get("pre")
+        desc = verified.get("desc")
+        hypo_local = verified.get("hypo_local")
+        if lift is None or transfer is None or desc is None or hypo_local is None:
+            return _fallback("source", "nghiệm cached thiếu trajectory")
+        place_start = pre if pre is not None else desc
+        if (not self._trajectory_boundary_close(lift, transfer)
+                or not self._trajectory_boundary_close(transfer, place_start)
+                or (pre is not None
+                    and not self._trajectory_boundary_close(pre, desc))):
+            return _fallback("source", "các đoạn cached không nối joint liên tục")
+        if not self._trajectory_start_close(lift, f"{label}/lift"):
+            return _fallback("source", "arm không còn ở start lift cached")
+        real_local = self._real_local_close_to_hypo(
+            obj_id, hypo_local, label)
+        if real_local is None:
+            return _fallback("source", "cách gắp thật khác giả định")
+        try:
+            attached, _world = self._scene_object_ids()
+            if obj_id not in attached or "__dry_carry__" in attached:
+                return _fallback(
+                    "source", f"attached state sai (attached={sorted(attached)})")
+            current_fingerprint = self._scene_cache_fingerprint(obj_id)
+            if current_fingerprint != verified.get("scene_fingerprint"):
+                return _fallback(
+                    "source", "pose/geometry/attached/ACM của scene đã đổi")
+        except Exception as exc:
+            return _fallback("source", f"không đối chiếu được scene ({exc})")
+
+        # Endpoint cached là hàm của trajectory (xác định), nhưng tâm quân phụ
+        # thuộc local THẬT. Kiểm tra TRƯỚC mọi chuyển động để gate fail còn
+        # có thể plan lại toàn chuỗi từ nguồn.
+        try:
+            last = desc.points[-1]
+            (fx, fy, fz), fq = self._fk_tcp_pose(
+                desc.joint_names, last.positions)
+            pos_err, tilt, _c, _q = self._piece_error_from_tcp(
+                (fx, fy, fz), fq, real_local, target_xy, dest_piece_type)
+        except Exception as exc:
+            return _fallback("source", f"FK-validate cached fail ({exc})")
+        if pos_err > PLACE_POSITION_TOL_M:
+            return _fallback(
+                "source",
+                f"local thật làm tâm endpoint cached lệch "
+                f"{pos_err * 1000:.1f}mm; tilt tham khảo "
+                f"{math.degrees(tilt):.1f}°")
+
+        # Revalidate toàn bộ waypoint với quân thật. ACM đúng phase: lift còn
+        # được chạm bàn tại nguồn; transfer/pre đóng; descend mở tại đích.
+        if not self._cached_trajectory_collision_free(lift, f"{label}/lift"):
+            return _fallback("source", "lift cached không còn collision-free")
+        self._set_piece_collision(
+            obj_id, gripper_touch=True, board_contact=False)
+        try:
+            if not self._cached_trajectory_collision_free(
+                    transfer, f"{label}/transfer"):
+                return _fallback(
+                    "source", "transfer cached không còn collision-free")
+            if pre is not None and not self._cached_trajectory_collision_free(
+                    pre, f"{label}/pre-place"):
+                return _fallback(
+                    "source", "pre-place cached không còn collision-free")
+            self._set_piece_collision(
+                obj_id, gripper_touch=True, board_contact=True)
+            if not self._cached_trajectory_collision_free(
+                    desc, f"{label}/descend"):
+                return _fallback(
+                    "source", "descend cached không còn collision-free")
+        finally:
+            # Trước lift runtime, quân vẫn ở mặt bàn nên phục hồi phase nguồn.
+            self._set_piece_collision(
+                obj_id, gripper_touch=True, board_contact=True)
+
+        # Qua toàn bộ gate, execute đúng nhánh đã kiểm tra.
+        self._execute_and_wait(self.moveit2, lift)
+        self._set_piece_collision(
+            obj_id, gripper_touch=True, board_contact=False)
+        if not self._trajectory_start_close(transfer, f"{label}/transfer"):
+            raise RuntimeError(
+                f"{label}: arm lệch start transfer cached sau lift")
+        self._execute_and_wait(self.moveit2, transfer)
+        next_traj = pre if pre is not None else desc
+        if not self._trajectory_start_close(next_traj, f"{label}/place"):
+            return _fallback("dest", "arm lệch start đoạn đặt cached")
+        if pre is not None:
+            self._execute_and_wait(self.moveit2, pre)
+            if not self._trajectory_start_close(desc, f"{label}/descend"):
+                return _fallback("dest", "arm lệch start descend cached")
+        self._set_piece_collision(
+            obj_id, gripper_touch=True, board_contact=True)
+        self._execute_and_wait(self.moveit2, desc)
+        self.get_logger().info(
+            f"[CACHED] {label}: execute đúng chuỗi precheck đã bù tâm FK")
+        return verified["place_tcp"], "done"
+
+    def _move_vertical_place_compensated(self, place_candidates,
+                                         step_name: str, obj_id: str,
+                                         target_xy, piece_type: str,
+                                         approach_z: float):
+        """Hạ đặt với XYZ compensation lặp và board-contact theo phase.
+
+        Robot đang ATTACHED ở approach đích. Mỗi vòng chỉ plan: FK endpoint
+        cho tâm quân dự kiến, sau đó dịch XYZ TCP ngược sai số và plan lại.
+        Quaternion không quyết định PASS và không đổi giữa các vòng.
+        Phase lateral (transit → pre-place): board_contact ĐÓNG để đường đi
+        của tay + quân được check va chạm bàn. Ngoại lệ board chỉ MỞ cho đúng
+        đoạn descend thẳng đứng pre-place → place.
+
+        Không hội tụ thì raise khi arm CHƯA hề nhúc nhích. Chỉ execute cặp
+        pre-place/descend cuối đã đưa tâm quân vào sai số 5 mm.
+        Trả về place_tcp đã execute thành công (board-contact đang MỞ, caller
+        verify → detach → retreat rồi mới đóng lại).
+        """
+        self._set_piece_collision(
+            obj_id, gripper_touch=True, board_contact=False)
+        errors = []
+        chosen = None
+        for rank, place_tcp in enumerate(place_candidates, 1):
+            for correction in range(PLACE_COMPENSATION_MAX_ITERATIONS):
+                px, py, pz, pq = (place_tcp[0], place_tcp[1],
+                                  place_tcp[2], place_tcp[3])
+                label = f"{step_name}/comp{correction + 1}"
+                try:
+                    # Transfer/pre-place là chuyển động xa hoặc dịch ngang:
+                    # dùng OMPL position-only để được đổi nhánh khớp. Chỉ
+                    # descend cuối mới bắt buộc Cartesian.
+                    pre = self._plan_motion(
+                        position=[px, py, approach_z],
+                        target_link=END_EFFECTOR,
+                        tolerance_position=0.002, cartesian=False)
+                except Exception as exc:
+                    errors.append(f"{label}: pre-place plan lỗi ({exc})")
+                    break
+                if pre is None:
+                    errors.append(f"{label}: không có OMPL pre-place")
+                    break
+                try:
+                    pre_end = self._joint_state_from_trajectory_end(pre)
+                    pre_last = pre.points[-1]
+                    _pre_xyz, pre_q = self._fk_tcp_pose(
+                        pre.joint_names, pre_last.positions)
+                except Exception as exc:
+                    errors.append(f"{label}: endpoint pre-place xấu ({exc})")
+                    break
+                try:
+                    self._set_piece_collision(
+                        obj_id, gripper_touch=True, board_contact=True)
+                    try:
+                        desc = self._plan_motion(
+                            _start_joint_state=pre_end,
+                            position=[px, py, pz], quat_xyzw=pre_q,
+                            target_link=END_EFFECTOR,
+                            tolerance_position=0.002,
+                            tolerance_orientation=0.03,
+                            cartesian=True, max_step=0.002,
+                            cartesian_fraction_threshold=0.999)
+                    finally:
+                        self._set_piece_collision(
+                            obj_id, gripper_touch=True,
+                            board_contact=False)
+                except Exception as exc:
+                    errors.append(f"{label}: descend plan/ACM lỗi ({exc})")
+                    break
+                if desc is None:
+                    errors.append(f"{label}: không có Cartesian descend")
+                    break
+                try:
+                    last = desc.points[-1]
+                    (fx, fy, fz), fq = self._fk_tcp_pose(
+                        desc.joint_names, last.positions)
+                    local = self._grasp_local_by_id.get(obj_id)
+                    if local is None:
+                        raise RuntimeError(f"thiếu T_tcp_piece của {obj_id}")
+                    pos_err, tilt, center, _q = self._piece_error_from_tcp(
+                        (fx, fy, fz), fq, local, target_xy, piece_type)
+                except Exception as exc:
+                    errors.append(f"{label}: FK lỗi ({exc})")
+                    break
+                if pos_err <= PLACE_POSITION_TOL_M:
+                    place_tcp = (px, py, pz, fq)
+                    self.get_logger().info(
+                        f"[PLACE-COMP] {step_name}: đạt sau "
+                        f"{correction + 1}/{PLACE_COMPENSATION_MAX_ITERATIONS} "
+                        f"lần, lệch {pos_err * 1000:.1f}mm; "
+                        f"tilt tham khảo {math.degrees(tilt):.1f}°")
+                    chosen = (pre, desc, place_tcp)
+                    break
+                corrected = self._compensate_place_tcp(
+                    place_tcp, center, target_xy, piece_type)
+                self.get_logger().info(
+                    f"[PLACE-COMP] {label}: tâm lệch "
+                    f"{pos_err * 1000:.1f}mm -> dịch TCP "
+                    f"({(corrected[0] - px) * 1000:.1f}, "
+                    f"{(corrected[1] - py) * 1000:.1f}, "
+                    f"{(corrected[2] - pz) * 1000:.1f})mm")
+                place_tcp = corrected
+            if chosen is not None:
+                break
+        if chosen is None:
+            raise RuntimeError(
+                f"FK cuối trajectory {step_name} không đưa tâm quân vào "
+                f"sai số {PLACE_POSITION_TOL_M * 1000:.0f}mm sau "
+                f"{PLACE_COMPENSATION_MAX_ITERATIONS} lần bù "
+                f"(arm chưa di chuyển): " + "; ".join(errors))
+        pre, desc, place_tcp = chosen
+        try:
+            if pre is not None:
+                self._execute_and_wait(self.moveit2, pre)
+        except Exception:
+            # Robot đã chuyển động: không thử plan khác, thoát để reconcile.
+            raise
+        # Đúng đoạn chạm bàn mới mở board-contact.
+        self._set_piece_collision(
+            obj_id, gripper_touch=True, board_contact=True)
+        try:
+            self._execute_and_wait(self.moveit2, desc)
+        except Exception:
+            # Fail-closed: thu hẹp ngoại lệ để motion phục hồi sau đó vẫn
+            # check va chạm bàn, rồi raise để reconcile.
+            try:
+                self._set_piece_collision(
+                    obj_id, gripper_touch=True, board_contact=False)
+            except Exception as acm_exc:
+                self.get_logger().warning(
+                    f"[PLACE-COMP] {step_name}: không thu hẹp board ACM sau "
+                    f"execute fail ({acm_exc})")
+            raise
+        return place_tcp
 
     def _plan_vertical_trajectory(self, x, y, z, q, step_name):
         """Plan Cartesian, không execute và không fallback.
