@@ -84,6 +84,7 @@ from .chess_utils import (
     NARROW_DESCENT_INNER_WIDTH,
     PICK_TCP_Z,
     PIECE_COLLISION,
+    PIECE_GRIP_Z,
     PIECE_PHYSICAL,
     PIECE_SPECS,
     TCP_OFFSET_CALIBRATED,
@@ -2204,14 +2205,18 @@ class PickPlaceNode(Node):
         if piece_world_xy is not None:
             pose = self._piece_local_pose(piece_type, piece_world_xy)
         else:
-            # Proxy discard bắt đầu đứng thẳng trong BASE_LINK và có tâm thấp
-            # hơn TCP đúng bằng quan hệ tại pose gắp chuẩn. Nhờ lưu orientation
-            # inverse của TCP, nó xoay theo arm giống một quân đã attach thật.
+            # Proxy discard bắt đầu đứng thẳng trong BASE_LINK và có tâm đúng
+            # bằng quan hệ gắp THẬT của chính loại quân này (TCP ở grip height
+            # riêng PIECE_GRIP_Z[type], không phải PICK_TCP_Z của tốt). Dùng
+            # chiều cao tốt cho proxy vua đặt proxy cao hơn ~11mm → đỉnh quân
+            # chui vào palm (arm5) ngay tại HOME và mọi transfer đều fail oan
+            # với contacts=arm5_Link<->__dry_carry__.
             spec = PIECE_SPECS[piece_type]
             transform = self.tf_buffer.lookup_transform(
                 BASE_LINK, END_EFFECTOR, rclpy.time.Time())
             q = transform.transform.rotation
-            dz = BOARD_Z + spec.pickup_height / 2 - PICK_TCP_Z
+            grip_z = PIECE_GRIP_Z.get(piece_type, PICK_TCP_Z)
+            dz = BOARD_Z + spec.pickup_height / 2 - grip_z
             local = self._rotate_by_inverse_quaternion((0.0, 0.0, dz), q)
             pose = Pose()
             pose.position.x, pose.position.y, pose.position.z = local
@@ -2447,6 +2452,32 @@ class PickPlaceNode(Node):
         except RuntimeError as exc:
             raise RuntimeError(f"scene invariant trước {label}: {exc}")
 
+    def _mapping_fingerprint(self):
+        """Snapshot mapping ô->id + discard để phát hiện drift sau diagnostic."""
+        return (tuple(sorted(self.piece_id_by_square.items())), self.discard_count)
+
+    @staticmethod
+    def _new_failure_items(deep: dict, before_sizes: dict) -> list[str]:
+        """Chỉ các failure mới thêm trong case này (không pollution case trước)."""
+        out = []
+        for key, items in deep.items():
+            for item in items[before_sizes.get(key, 0):]:
+                out.append(f"{key}:{item}")
+        return out
+
+    def _find_empty_scratch(self) -> str | None:
+        """Ô tạm còn trống cả trên board python-chess lẫn mapping scene.
+
+        Case trước có thể strand quân ở scratch cũ (forward PASS + return
+        FAIL); chọn ô khác mỗi case để case sau không fail oan vì đặt vào ô
+        đã bị chiếm.
+        """
+        for candidate in ("e4", "d5", "c4", "f5", "e5", "d4", "c5", "f4"):
+            if self.board.piece_at(chess.parse_square(candidate)) is None \
+                    and candidate not in self.piece_id_by_square:
+                return candidate
+        return None
+
     def _check_reachability_impl(self, _request, response):
         """Kiểm tra khả năng gắp thật theo 2 tầng, CHỈ cho quân TRẮNG.
 
@@ -2567,15 +2598,10 @@ class PickPlaceNode(Node):
                 f"collision={'ON' if COLLISION_ENABLED else 'OFF'})..."
             )
             deep: dict = {}
-            # Mỗi ca đặt tạm vào một ô trống, rồi chạy chiều ngược để trả quân
-            # về source. Không làm thay đổi board state sau deep-check.
-            scratch_square = next(
-                (candidate for candidate in ("e4", "d5", "c4", "f5")
-                 if self.board.piece_at(chess.parse_square(candidate)) is None),
-                None,
-            )
-            if scratch_square is None:
-                raise RuntimeError("deep-check cần một ô trống trong e4/d5/c4/f5")
+            # Mỗi case đặt tạm vào một ô trống (chọn động từng case), rồi chạy
+            # chiều ngược để trả quân về source. Không làm thay đổi board state
+            # sau deep-check nếu mọi case PASS.
+            mapping_before = self._mapping_fingerprint()
             # TODO-4: chạy đủ toàn bộ matrix, KHÔNG fail-fast. Mỗi case độc lập:
             # reset HOME/scene/ACM/controller trước, check invariant sau.
             case_results: list[tuple[str, str, str]] = []  # (case, verdict, reason)
@@ -2593,7 +2619,13 @@ class PickPlaceNode(Node):
                                     []).append(f"{square}: {reason}")
                     self.get_logger().error(f"[DIAG] {square}: {verdict} ({reason})")
                     continue
-                before = sum(len(items) for items in deep.values())
+                scratch_square = self._find_empty_scratch()
+                if scratch_square is None:
+                    reason = "không còn ô trống làm scratch (scene drift nhiều case)"
+                    case_results.append((square, "INFRA_ERROR", reason))
+                    deep.setdefault("infra", []).append(f"{square}: {reason}")
+                    continue
+                before_sizes = {k: len(v) for k, v in deep.items()}
                 try:
                     self._dry_run_square(square, piece_type, scratch_square, deep, execute)
                 except Exception as exc:
@@ -2602,17 +2634,18 @@ class PickPlaceNode(Node):
                                     []).append(f"{square}: {exc}")
                     case_results.append((square, verdict, str(exc)))
                 squares_done += 1
-                after = sum(len(items) for items in deep.values())
-                if after == before:
+                new_items = self._new_failure_items(deep, before_sizes)
+                if not new_items:
                     case_results.append((square, "PASS", ""))
                     self.get_logger().info(
                         f"[DIAG] {square}: PASS (seed vùng "
                         f"{self._region_for_target(square_to_xy(square))})")
                 else:
-                    # _dry_run_square đã ghi chi tiết vào deep{}; phân loại thêm.
-                    last_err = "; ".join(
-                        f"{k}:{v[-1]}" for k, v in deep.items() if v)
-                    verdict = ("INFRA_ERROR" if "infra" in deep else "FAIL")
+                    # _dry_run_square đã ghi chi tiết vào deep{}; chỉ lấy phần
+                    # mới của case này để không pollution case trước.
+                    last_err = "; ".join(new_items)
+                    verdict = ("INFRA_ERROR" if any(
+                        i.startswith("infra") for i in new_items) else "FAIL")
                     case_results.append((square, verdict, last_err))
                 try:
                     self._assert_scene_invariant(f"diagnostic sau ô {square}")
@@ -2630,7 +2663,7 @@ class PickPlaceNode(Node):
                     deep.setdefault("infra" if verdict == "INFRA_ERROR" else "reset",
                                     []).append(f"slot{slot}: {reason}")
                     continue
-                before = sum(len(items) for items in deep.values())
+                before_sizes = {k: len(v) for k, v in deep.items()}
                 try:
                     self._dry_run_discard_slot(
                         slot, deep,
@@ -2641,13 +2674,13 @@ class PickPlaceNode(Node):
                                     []).append(f"slot{slot}: {exc}")
                     case_results.append((f"slot{slot}", verdict, str(exc)))
                 slots_done += 1
-                after = sum(len(items) for items in deep.values())
-                if after == before:
+                new_items = self._new_failure_items(deep, before_sizes)
+                if not new_items:
                     case_results.append((f"slot{slot}", "PASS", ""))
                 else:
-                    last_err = "; ".join(
-                        f"{k}:{v[-1]}" for k, v in deep.items() if v)
-                    verdict = ("INFRA_ERROR" if "infra" in deep else "FAIL")
+                    last_err = "; ".join(new_items)
+                    verdict = ("INFRA_ERROR" if any(
+                        i.startswith("infra") for i in new_items) else "FAIL")
                     case_results.append((f"slot{slot}", verdict, last_err))
                 try:
                     self._assert_scene_invariant(f"diagnostic sau slot{slot}")
@@ -2670,10 +2703,12 @@ class PickPlaceNode(Node):
                 except Exception as exc:
                     deep.setdefault("home", []).append(f"final-home: {exc}")
             if execute and (sum(len(v) for v in deep.values()) > 0
-                            or self._carry_state != "WORLD_SOURCE"):
+                            or self._carry_state != "WORLD_SOURCE"
+                            or self._mapping_fingerprint() != mapping_before):
                 # Dry-run execute fail giữa chừng có thể để quân ở ô tạm hoặc
-                # attached trong khi self.board vẫn là thế cờ cũ (Fix 8): khóa
-                # hệ thống, không cho game/check chạy tiếp trên scene sai.
+                # attached trong khi self.board vẫn là thế cờ cũ (Fix 8), kể cả
+                # khi mapping drift nhưng scene vẫn nhất quán nội bộ: khóa hệ
+                # thống, không cho game/check chạy tiếp trên scene sai.
                 self._needs_recovery = True
                 self.get_logger().error(
                     "[RECOVERY-REQUIRED] deep-check execute có lỗi; quân có "
@@ -3513,10 +3548,14 @@ class PickPlaceNode(Node):
         Một scratch session duy nhất giữ T_tcp_piece giả định của đúng offset
         đang thử xuyên suốt: lift Cartesian (từ pose descend hiện tại) →
         transfer position-only tới approach đích (start nối từ cuối lift) →
-        pre-place bù bằng OMPL position-only (được đổi nhánh khớp) →
-        descend Cartesian (start nối từ cuối pre-place) → FK endpoint.
-        Chỉ chốt offset khi tồn tại nghiệm đưa tâm quân vào sai số 5 mm;
-        orientation của quân chỉ ghi log, không dùng làm điều kiện loại.
+        pre-place (OMPL tới joint target IK theo từng seed) → descend
+        Cartesian (start nối từ cuối pre-place) → FK endpoint.
+        Mỗi pre-place sinh hữu hạn candidate IK/joint-state (TODO-2): IK query
+        với seed chain-end + current + HOME + template vùng bàn cờ, rồi OMPL
+        joint-goal tới nghiệm IK (đổi nhánh khớp thật thay vì position-only một
+        nhánh). Chỉ chốt offset khi tồn tại candidate đưa tâm quân vào sai số
+        5 mm VÀ tilt ≤ 26° hard (TODO-2/3); trong các candidate đạt chọn tilt
+        nhỏ nhất, thoát sớm khi ≤ 11°.
 
         Attach scratch fail → None (FAIL kiểm tra transfer, KHÔNG fallback
         IK-only rồi PASS). Mọi plan trong chuỗi đều có mang (scratch attached).
@@ -3600,99 +3639,124 @@ class PickPlaceNode(Node):
                 return None
             yaw_cands = self._place_yaw_candidates_for_local(
                 hypo_local, target_xy, dest_piece_type, grasp_q, yaw_count)
+            # TODO-2: seed IK hữu hạn cho mỗi pre-place (chain-end + current +
+            # HOME + template vùng). Seed chỉ đổi nghiệm IK (nhánh khớp), mọi
+            # pre đều start nối từ cuối transfer nên chuỗi vẫn liên tục.
+            region = self._region_for_target(target_xy)
+            seed_states = [("chain", transfer_end)] + [
+                (label, state)
+                for label, state in self._candidate_seed_states(region)
+            ]
+            best = None  # (tilt, pos_err, pre, desc, place_tcp, fq, label)
             for place_tcp, _k, _psi in yaw_cands:
+                if best is not None and best[0] <= PREFERRED_TILT_RAD:
+                    break
                 for correction in range(PLACE_COMPENSATION_MAX_ITERATIONS):
                     px, py, pz, pq = (place_tcp[0], place_tcp[1],
                                       place_tcp[2], place_tcp[3])
                     label = f"{context}/comp{correction + 1}"
                     # Plan-only từ đúng cuối transfer ở mọi vòng; arm chưa di
-                    # chuyển. Quaternion chỉ là seed API, không phải điều kiện
-                    # PASS. XYZ được sửa theo tâm quân FK của vòng trước.
-                    pre = self._plan_quiet(
-                        f"{label}/pre-place",
-                        _start_joint_state=transfer_end,
-                        position=[px, py, target_approach_z],
-                        target_link=END_EFFECTOR,
-                        tolerance_position=0.002, cartesian=False)
-                    if pre is None:
-                        break
-                    try:
-                        pre_end = self._joint_state_from_trajectory_end(pre)
-                        pre_last = pre.points[-1]
-                        _pre_xyz, pre_q = self._fk_tcp_pose(
-                            pre.joint_names, pre_last.positions)
-                    except Exception:
-                        break
-                    try:
-                        self._set_piece_collision(
-                            scratch_id, gripper_touch=True, board_contact=True)
-                        desc = self._plan_quiet(
-                            f"{label}/descend",
-                            _start_joint_state=pre_end,
-                            position=[px, py, pz], quat_xyzw=pre_q,
-                            target_link=END_EFFECTOR,
-                            tolerance_position=0.002,
-                            tolerance_orientation=0.03,
-                            cartesian=True, max_step=CARTESIAN_MAX_STEP_M,
-                            cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD)
-                    finally:
-                        self._set_piece_collision(
-                            scratch_id, gripper_touch=True,
-                            board_contact=False)
-                    if desc is None:
-                        break
-                    try:
-                        last = desc.points[-1]
-                        (fx, fy, fz), fq = self._fk_tcp_pose(
-                            desc.joint_names, last.positions)
-                        pos_err, tilt, center, _q = self._piece_error_from_tcp(
-                            (fx, fy, fz), fq, hypo_local,
-                            target_xy, dest_piece_type)
-                    except Exception:
-                        break
-                    if pos_err <= PLACE_POSITION_TOL_M:
-                        # TODO-2/3: tilt > 26° là hard-reject ngay cả ở precheck.
-                        # Chấp nhận nghiệm nghiêng 40° ở đây chỉ đẩy failure sang
-                        # runtime (cached reuse rớt, compensation không hội tụ)
-                        # với log khó hiểu. Thử yaw kế thay vì chốt.
+                    # chuyển. XYZ được sửa theo tâm quân FK của vòng trước.
+                    corr_best = None
+                    corr_center = None
+                    for seed_label, seed_state in seed_states:
+                        ik_map = self._query_ik_joint_target(
+                            [px, py, target_approach_z], pq, seed_state,
+                            f"{label}/ik-{seed_label}")
+                        if ik_map is None:
+                            continue
+                        ik_names = [n for n in JOINT_NAMES if n in ik_map]
+                        if len(ik_names) != len(JOINT_NAMES):
+                            continue
+                        pre = self._plan_quiet(
+                            f"{label}/pre-{seed_label}",
+                            _start_joint_state=transfer_end,
+                            joint_positions=[float(ik_map[n]) for n in ik_names],
+                            joint_names=ik_names,
+                            tolerance_joint_position=0.02,
+                            cartesian=False)
+                        if pre is None:
+                            continue
+                        try:
+                            pre_end = self._joint_state_from_trajectory_end(pre)
+                            pre_last = pre.points[-1]
+                            _pre_xyz, pre_q = self._fk_tcp_pose(
+                                pre.joint_names, pre_last.positions)
+                        except Exception:
+                            continue
+                        try:
+                            self._set_piece_collision(
+                                scratch_id, gripper_touch=True, board_contact=True)
+                            desc = self._plan_quiet(
+                                f"{label}/descend-{seed_label}",
+                                _start_joint_state=pre_end,
+                                position=[px, py, pz], quat_xyzw=pre_q,
+                                target_link=END_EFFECTOR,
+                                tolerance_position=0.002,
+                                tolerance_orientation=0.03,
+                                cartesian=True, max_step=CARTESIAN_MAX_STEP_M,
+                                cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD)
+                        finally:
+                            self._set_piece_collision(
+                                scratch_id, gripper_touch=True,
+                                board_contact=False)
+                        if desc is None:
+                            continue
+                        try:
+                            last = desc.points[-1]
+                            (fx, fy, fz), fq = self._fk_tcp_pose(
+                                desc.joint_names, last.positions)
+                            pos_err, tilt, center, _q = self._piece_error_from_tcp(
+                                (fx, fy, fz), fq, hypo_local,
+                                target_xy, dest_piece_type)
+                        except Exception:
+                            continue
+                        if pos_err > PLACE_POSITION_TOL_M:
+                            continue
                         if tilt > MAX_ACCEPTED_TILT_RAD:
                             self._last_chain_failure_reason = (
                                 f"nghiệm đạt tâm nhưng tilt "
                                 f"{math.degrees(tilt):.1f}° > hard "
                                 f"{math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°")
-                            self.get_logger().warning(
-                                f"[CHAIN] {context}: loại yaw (tilt "
-                                f"{math.degrees(tilt):.1f}° vượt hard limit) "
-                                f"-> thử yaw kế")
-                            break
-                        # Quaternion thực tế của endpoint, chỉ dùng để retreat
-                        # giữ pose hiện tại; không phải constraint của quân.
-                        place_tcp = (px, py, pz, fq)
-                        self.get_logger().info(
-                            f"[CHAIN] {context}: bù tâm FK đạt sau "
-                            f"{correction + 1}/{PLACE_COMPENSATION_MAX_ITERATIONS} "
-                            f"lần, lệch {pos_err * 1000:.1f}mm; "
-                            f"tilt {math.degrees(tilt):.1f}° "
-                            f"(target <={math.degrees(PREFERRED_TILT_RAD):.0f}°, "
-                            f"hard <={math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°)")
-                        return {"lift": lift, "transfer": transfer,
-                                "pre": pre, "desc": desc,
-                                "hypo_local": copy.deepcopy(hypo_local),
-                                "scene_fingerprint": scene_fingerprint,
-                                "place_tcp": place_tcp, "place_quat": fq,
-                                "pos_err": pos_err, "tilt": tilt}
+                            continue
+                        cand = (tilt, pos_err, pre, desc, (px, py, pz, fq),
+                                fq, f"{label}/{seed_label}")
+                        if corr_best is None or tilt < corr_best[0]:
+                            corr_best = cand
+                            corr_center = center
+                    if corr_best is None:
+                        break  # yaw này hết cửa -> yaw kế
+                    if best is None or corr_best[0] < best[0]:
+                        best = corr_best
+                    tilt_b, err_b = corr_best[0], corr_best[1]
+                    if tilt_b <= PREFERRED_TILT_RAD:
+                        break  # rất tốt: chốt ngay
                     corrected = self._compensate_place_tcp(
-                        place_tcp, center, target_xy, dest_piece_type)
+                        corr_best[4], corr_center, target_xy, dest_piece_type)
                     self.get_logger().info(
                         f"[PLACE-COMP] {label}: tâm lệch "
-                        f"{pos_err * 1000:.1f}mm -> dịch TCP "
+                        f"{err_b * 1000:.1f}mm tilt {math.degrees(tilt_b):.1f}° "
+                        f"-> dịch TCP "
                         f"({(corrected[0] - px) * 1000:.1f}, "
                         f"{(corrected[1] - py) * 1000:.1f}, "
                         f"{(corrected[2] - pz) * 1000:.1f})mm")
                     place_tcp = corrected
+            if best is not None:
+                tilt, pos_err, pre, desc, place_tcp, fq, blabel = best
+                self.get_logger().info(
+                    f"[CHAIN] {context}: chọn candidate {blabel}, lệch "
+                    f"{pos_err * 1000:.1f}mm; tilt {math.degrees(tilt):.1f}° "
+                    f"(target <={math.degrees(PREFERRED_TILT_RAD):.0f}°, "
+                    f"hard <={math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°)")
+                return {"lift": lift, "transfer": transfer,
+                        "pre": pre, "desc": desc,
+                        "hypo_local": copy.deepcopy(hypo_local),
+                        "scene_fingerprint": scene_fingerprint,
+                        "place_tcp": place_tcp, "place_quat": fq,
+                        "pos_err": pos_err, "tilt": tilt}
             self.get_logger().warning(
-                f"[CHAIN] {context}: lift + transfer đạt nhưng bù tâm FK "
-                f"không hội tụ sau {PLACE_COMPENSATION_MAX_ITERATIONS} lần "
+                f"[CHAIN] {context}: lift + transfer đạt nhưng không candidate "
+                f"(yaw × seed IK) nào đưa tâm vào sai số "
                 f"-> loại offset")
             if not getattr(self, "_last_chain_failure_reason", "").startswith("nghiệm đạt tâm nhưng tilt"):
                 self._last_chain_failure_reason = (
