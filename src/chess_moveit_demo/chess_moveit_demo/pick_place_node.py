@@ -1501,14 +1501,21 @@ class PickPlaceNode(Node):
                 problems.append(f"{oid} (ô {sq}) mất dấu khỏi scene")
             if in_w and in_a:
                 problems.append(f"{oid} (ô {sq}) double world+attached")
-        # World/attached/board/discard khớp nhau (TODO-5/6): số quân world
-        # (trừ scratch) phải bằng quân trên board python-chess + discard_count.
+        # World/attached/board/discard khớp nhau (TODO-5/6): quân trong world +
+        # quân đang attached hợp lệ phải bằng quân trên board python-chess +
+        # discard_count. Quân đang attached (vừa gắp, mapping đã pop) KHÔNG có
+        # trong world nhưng VẪN tính trong board — trừ nó ra khỏi vế world mà
+        # không cộng vế attached là off-by-one, fail oan ngay attach đầu tiên
+        # (đã làm rớt diagnostic a1->e4 và sẽ làm rớt cả nước Trắng đầu tiên).
         world_pieces = [i for i in world_ids
                         if i.startswith("piece_") and not i.startswith("__dry_")]
+        attached_tracked = [i for i in attached_ids
+                            if i.startswith("piece_") and not i.startswith("__dry_")]
         n_board = len(self.board.piece_map())
-        if len(world_pieces) != n_board + self.discard_count:
+        if len(world_pieces) + len(attached_tracked) != n_board + self.discard_count:
             problems.append(
                 f"world/board/discard lệch: world={len(world_pieces)} "
+                f"attached={len(attached_tracked)} "
                 f"board={n_board} discard={self.discard_count}")
         if problems:
             self._needs_recovery = True
