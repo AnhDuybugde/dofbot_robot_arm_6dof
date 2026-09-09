@@ -58,6 +58,32 @@ REACHABILITY_EXECUTE_ON_FAKESYSTEM = True
 # làm rơi/lệch quân mà flow vẫn attach như thành công.
 ALLOW_CARTESIAN_FALLBACK = False
 
+# ==== BUDGET PLANNING CỨNG (P1-P4 review) ====
+# Một timeout ngoài (vd. GRASP_SEARCH_TIMEOUT_SEC) không đủ vì candidate ×
+# yaw × seed × comp × timeout lồng nhau vẫn kéo dài hàng chục phút. Mọi service
+# planning (IK/OMPL/Cartesian/FK/scene/ACM) chỉ được chờ
+# timeout = min(default_timeout, remaining_của_deadline_chung).
+class PlanningBudgetExceeded(RuntimeError):
+    """Hết budget planning của một nước — dừng tìm candidate, KHÔNG phải lỗi
+    robot. Caller chuẩn hoá thành NACK/PLACE_PRECHECK_FAILED với lý do budget."""
+
+
+# Budget planning cho phase TÌM candidate một nước (targeted 40-60s trên máy
+# VMware + mesh nặng; đo profiling rồi mới giảm về 20-40s). Chỉ giới hạn
+# PLANNING (plan-only), không giới hạn EXECUTION vật lý.
+MOVE_PLANNING_BUDGET_SEC = 50.0
+# Budget planning cho replan runtime khi cache invalid (đã ATTACHED hoặc sắp
+# execute: ít candidate hơn vì đi từ current state, không tìm offset).
+RUNTIME_REPLAN_BUDGET_SEC = 30.0
+# Timeout từng request (một OMPL request 3-5s, Cartesian 2-3s, IK 0.5-1s,
+# scene 1-2s theo review; RRTConnect thường xong <1s ở scene này).
+OMPL_PLANNING_TIMEOUT_SEC = 5.0
+CARTESIAN_PLANNING_TIMEOUT_SEC = 5.0
+IK_WAIT_TIMEOUT_SEC = 1.5
+FK_SERVICE_TIMEOUT_SEC = 2.0
+SCENE_SERVICE_TIMEOUT_SEC = 2.0
+ACM_APPLY_TIMEOUT_SEC = 5.0
+
 # Tổng thời gian tối đa cho tìm candidate gắp 1 ô (Fix 6): thử offset mà
 # không trần thời gian có thể treo lượt đi khi scene khó. Hết trần -> raise
 # để NACK thay vì thử mãi.
@@ -75,7 +101,14 @@ RANKS = "12345678"
 @dataclass
 class PieceSpec:
     pickup_height: float   # chiều cao collision/visual của quân từ mặt bàn (m)
-    gripper_open: float    # độ mở gripper (m hoặc rad, tuỳ cấu hình gripper của bạn)
+    gripper_open_rad: float = 0.0   # góc mở kẹp khi tiếp cận/gắp loại quân này (rad)
+    gripper_close_rad: float = 1.57  # góc khép kẹp khi mang loại quân này (rad)
+    # Hai giai đoạn kẹp (SIM default, chờ bảng FK đo thật P8 mới thành số vật
+    # lý): khép SƠ BỘ ở cao độ approach trước descend + mở VỪA ĐỦ khi release
+    # (không mở hết cỡ). Phải thỏa open <= preclose <= close và
+    # open <= release <= close (validate ở dưới, fail-loud lúc import).
+    gripper_preclose_rad: float = 0.7
+    gripper_release_rad: float = 0.7
 
 
 # Kích thước danh nghĩa quân thật (visual/RViz). Collision dùng bảng riêng
@@ -97,15 +130,19 @@ PIECE_COLLISION = {
     "q": {"radius": 0.0100, "height": 0.044},
     "k": {"radius": 0.0100, "height": 0.050},
 }
-# Giữ tên cũ để không sửa mọi caller: pickup_height = collision height mới,
-# gripper_open giữ nguyên ngưỡng logic cũ (mở>0/đóng=0, xem _set_gripper).
+# Góc kẹp liên tục theo rad (KHÔNG binary): mở 0.0 = xòe hết cỡ cho hành
+# lang approach/descend rộng nhất; khép tới đúng mặt quân, không khép mù
+# 1.57 mọi loại (xuyên quân trong sim, bóp méo/mất lực trên robot thật).
+# Giá trị close là default SIM (chưa phải calibration vật lý): tốt nhỏ nhất
+# nên khép ít nhất; các quân lớn giữ 1.57 đã chứng minh plan/execute được.
+# Đừng suy mm->rad tuyến tính (khớp mimic phi tuyến); bảng FK đo thật là P8.
 PIECE_SPECS = {
-    "p": PieceSpec(pickup_height=0.026, gripper_open=0.018),
-    "r": PieceSpec(pickup_height=0.030, gripper_open=0.022),
-    "n": PieceSpec(pickup_height=0.034, gripper_open=0.020),
-    "b": PieceSpec(pickup_height=0.038, gripper_open=0.018),
-    "q": PieceSpec(pickup_height=0.044, gripper_open=0.020),
-    "k": PieceSpec(pickup_height=0.050, gripper_open=0.020),
+    "p": PieceSpec(pickup_height=0.026, gripper_open_rad=0.0, gripper_close_rad=1.30),
+    "r": PieceSpec(pickup_height=0.030, gripper_open_rad=0.0, gripper_close_rad=1.57),
+    "n": PieceSpec(pickup_height=0.034, gripper_open_rad=0.0, gripper_close_rad=1.57),
+    "b": PieceSpec(pickup_height=0.038, gripper_open_rad=0.0, gripper_close_rad=1.57),
+    "q": PieceSpec(pickup_height=0.044, gripper_open_rad=0.0, gripper_close_rad=1.57),
+    "k": PieceSpec(pickup_height=0.050, gripper_open_rad=0.0, gripper_close_rad=1.57),
 }
 
 # "Nghĩa địa" quân bị ăn: lưới 4x4=16 slot cạnh bàn phía -Y (bên file a),
@@ -142,8 +179,10 @@ PIECE_GRIP_Z_SIM = {
     "p": 0.055, "r": 0.058, "n": 0.059, "b": 0.061, "q": 0.064, "k": 0.066,
 }
 PIECE_GRIP_Z = dict(PIECE_GRIP_Z_SIM)
-# Gripper binary hiện tại (chưa map mm->rad vì mimic phi tuyến, cấm nội suy
-# tuyến tính angle = width/max*1.57). Mở hoàn toàn có thể rộng hơn ô 26mm.
+# Giới hạn khớp kẹp Rlink1_Joint (URDF: 0..1.57). _set_gripper nhận MỌI giá
+# trị rad liên tục trong đoạn này (fail-loud ngoài đoạn, không clamp câm).
+# Đừng suy mm->rad tuyến tính (khớp mimic phi tuyến); muốn đặt theo mm phải
+# có bảng FK gripper_width_to_joint_angle đo thật (P8).
 GRIPPER_OPEN_RAD = 0.0
 GRIPPER_CLOSED_RAD = 1.57
 # 3 phase widths tương lai: cần bảng FK/calibration joint->khoảng cách mặt
@@ -155,6 +194,19 @@ HIGH_APPROACH_WIDTH = HIGH_APPROACH_INNER_WIDTH
 NARROW_DESCENT_WIDTH = NARROW_DESCENT_INNER_WIDTH
 FINAL_GRASP_WIDTH = FINAL_GRASP_INNER_WIDTH
 FINGER_THICKNESS = 0.006
+# Fail-loud lúc import: trình tự 2 giai đoạn chỉ đúng khi góc giữa (sơ bộ /
+# release) nằm trong đoạn [mở, khép cuối]. Đảo thứ tự (vd. preclose > close)
+# sẽ thành "sơ bộ khép chặt hơn cả siết cuối" mà không ai biết.
+for _pt, _spec in PIECE_SPECS.items():
+    if not (GRIPPER_OPEN_RAD <= _spec.gripper_open_rad <= GRIPPER_CLOSED_RAD
+            and GRIPPER_OPEN_RAD <= _spec.gripper_close_rad <= GRIPPER_CLOSED_RAD
+            and _spec.gripper_open_rad <= _spec.gripper_preclose_rad <= _spec.gripper_close_rad
+            and _spec.gripper_open_rad <= _spec.gripper_release_rad <= _spec.gripper_close_rad):
+        raise ValueError(
+            f"PIECE_SPECS[{_pt!r}] sai thứ tự góc kẹp 2 giai đoạn: "
+            f"open={_spec.gripper_open_rad} preclose={_spec.gripper_preclose_rad} "
+            f"release={_spec.gripper_release_rad} close={_spec.gripper_close_rad}")
+del _pt, _spec
 # Motion: bỏ RETREAT 40mm, dùng chung clearance 65mm cho cả 3 bước.
 CARTESIAN_EEF_STEP = 0.002
 MIN_CARTESIAN_FRACTION = 0.98
