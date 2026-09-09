@@ -183,7 +183,7 @@ DOFBOT_JOINT_LIMITS = {
     "arm4_Joint": (-1.57080, 1.57080),
     "arm5_Joint": (-2.09440, 2.09440),
 }
-JOINT_LIMIT_MARGIN_RAD = 0.08
+JOINT_LIMIT_MARGIN_RAD = 0.05
 # Bước nhảy joint bất thường trong một trajectory (rad giữa 2 waypoint kề).
 MAX_JOINT_STEP_RAD = 0.6
 # Scoring candidate (TODO-2): trọng số cho err (m), tilt (rad), travel (rad),

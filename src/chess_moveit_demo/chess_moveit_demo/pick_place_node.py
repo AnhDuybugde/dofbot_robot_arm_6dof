@@ -4177,13 +4177,28 @@ class PickPlaceNode(Node):
                                      if pre is not None else 0.0,
                                      self._trajectory_max_step(desc)) > MAX_JOINT_STEP_RAD:
                                 reject = ("bước nhảy joint bất thường")
-                            elif not self._cached_trajectory_collision_free(
-                                    desc, f"{label}/descend"):
-                                reject = "trajectory descend collision"
-                            elif (pre is not None
-                                  and not self._cached_trajectory_collision_free(
-                                      pre, f"{label}/pre-place")):
-                                reject = "trajectory pre-place collision"
+                            else:
+                                # Revalidate đúng phase ACM như lúc planner check:
+                                # descend chạm bàn -> board_contact MỞ; pre-place
+                                # trên cao -> ĐÓNG. Revalidate descend với ACM
+                                # lateral (đóng) sẽ báo board<->piece va chạm
+                                # oan tại điểm chạm bàn và loại hết candidate.
+                                self._set_piece_collision(
+                                    obj_id, gripper_touch=True,
+                                    board_contact=True)
+                                try:
+                                    desc_free = self._cached_trajectory_collision_free(
+                                        desc, f"{label}/descend")
+                                finally:
+                                    self._set_piece_collision(
+                                        obj_id, gripper_touch=True,
+                                        board_contact=False)
+                                if not desc_free:
+                                    reject = "trajectory descend collision"
+                                elif (pre is not None
+                                      and not self._cached_trajectory_collision_free(
+                                          pre, f"{label}/pre-place")):
+                                    reject = "trajectory pre-place collision"
                         except Exception as exc:
                             reject = f"gate candidate lỗi ({exc})"
                     if reject is not None:
