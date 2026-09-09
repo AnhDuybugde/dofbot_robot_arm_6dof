@@ -779,13 +779,34 @@ class PickPlaceNode(Node):
                 "scene ban đầu chưa đạt 33/33: " + "; ".join(reasons))
 
     def _clear_chess_scene_objects(self):
-        """Dọn object cờ cũ trước khi dựng lại (best-effort, không raise)."""
+        """Dọn object cờ cũ trước khi dựng lại (best-effort, không raise).
+
+        Gỡ cả attached (node cũ chết giữa chừng có thể để quân dính trên
+        gripper trong scene) lẫn world.
+        """
         if not COLLISION_ENABLED:
             return
         try:
-            _attached, world_ids = self._scene_object_ids()
+            attached_ids, world_ids = self._scene_object_ids()
         except Exception:
             return
+        for oid in list(attached_ids):
+            if oid == "chessboard" or oid.startswith("piece_") or oid.startswith("__dry_"):
+                try:
+                    aco = AttachedCollisionObject()
+                    aco.link_name = END_EFFECTOR
+                    aco.object.id = oid
+                    aco.object.operation = CollisionObject.REMOVE
+                    self._apply_attached_object(aco)
+                except Exception:
+                    pass
+        try:
+            attached_ids, world_ids = self._scene_object_ids()
+        except Exception:
+            attached_ids, world_ids = set(), set()
+        if attached_ids & {o for o in attached_ids
+                           if o == "chessboard" or o.startswith("piece_") or o.startswith("__dry_")}:
+            return  # còn attached lạ, verify ở caller sẽ báo rõ
         for oid in list(world_ids):
             if oid == "chessboard" or oid.startswith("piece_") or oid.startswith("__dry_"):
                 try:
