@@ -2522,6 +2522,18 @@ class PickPlaceNode(Node):
                             reason += "; contacts=" + ",".join(contacts)
                         self._reachability_failure_details.append(
                             ("fast", phase, name, reason))
+                except Exception as exc:
+                    # TODO-4: fast phase cũng full-matrix — một ô timeout/flake
+                    # (vd. OMPL >30s lúc warm-up) không được sập cả run.
+                    verdict = self._classify_diagnostic_error(exc)
+                    failures.setdefault(
+                        "infra" if verdict == "INFRA_ERROR" else "exception",
+                        []).append(name)
+                    self._reachability_failure_details.append(
+                        ("fast", "infra" if verdict == "INFRA_ERROR" else "exception",
+                         name, str(exc).replace("\n", " ")))
+                    self.get_logger().warning(
+                        f"[DIAG] fast {name}: {verdict} ({exc}) — tiếp ô khác")
                 finally:
                     if obj_id and COLLISION_ENABLED:
                         self._set_object_gripper_collision(obj_id, False)
@@ -2695,8 +2707,15 @@ class PickPlaceNode(Node):
                     f"[DIAG-CASE] {case}: {verdict}"
                     + (f" ({reason})" if reason else ""))
         except Exception as exc:
-            if REACHABILITY_EXECUTE_ON_FAKESYSTEM:
+            # Chỉ khóa RECOVERY khi scene/carry thực sự lệch (execute dở dang),
+            # không khóa oan vì plan timeout ở fast phase (scene không đổi).
+            if self._carry_state != "WORLD_SOURCE":
                 self._needs_recovery = True
+            else:
+                try:
+                    self._assert_scene_invariant("diagnostic-abort")
+                except Exception:
+                    pass  # _assert đã tự khóa + log chi tiết
             response.success = False
             response.message = f"Reachability check thất bại: {exc}"
         return response
