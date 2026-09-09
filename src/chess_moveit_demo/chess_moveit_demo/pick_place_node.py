@@ -1056,6 +1056,19 @@ class PickPlaceNode(Node):
         # thấy sai phase (vd. thiếu entry chessboard, board<->piece báo oan).
         # Chờ tới khi entry đọc về khớp giá trị vừa ghi.
         self._wait_for_acm_pair(obj_id, gripper_touch, board_contact)
+        # TMP-DEBUG: ghi evolution entry names để truy race baseline/runtime.
+        try:
+            names = self._acm_entry_names()
+            self.get_logger().info(
+                f"[ACM-DBG] set {obj_id} touch={gripper_touch} board={board_contact} "
+                f"-> entries={len(names)} has_board={'chessboard' in names}")
+        except Exception:
+            pass
+
+    def _acm_entry_names(self) -> list[str]:
+        scene = self._get_planning_scene(
+            PlanningSceneComponents.ALLOWED_COLLISION_MATRIX)
+        return list(scene.allowed_collision_matrix.entry_names)
 
     def _acm_pair_visible(self, obj_id: str, gripper_touch: bool,
                           board_contact: bool) -> bool:
@@ -1685,6 +1698,14 @@ class PickPlaceNode(Node):
             self.get_logger().warning(
                 "[CACHED] fingerprint đọc 2 lần khác nhau (scene đang churn); "
                 "dùng snapshot mới nhất")
+        # TMP-DEBUG: evolution entries để truy race baseline/runtime.
+        try:
+            names = second[2]
+            self.get_logger().info(
+                f"[ACM-DBG] fingerprint carried={carried_id} "
+                f"-> entries={len(names)} has_board={'chessboard' in names}")
+        except Exception:
+            pass
         return second
 
     def _scene_fingerprint_of(self, scene, carried_id: str | None):
