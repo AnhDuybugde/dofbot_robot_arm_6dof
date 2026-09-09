@@ -1051,6 +1051,55 @@ class PickPlaceNode(Node):
         result = future.result()
         if result is None or not result.success:
             raise RuntimeError("apply_planning_scene từ chối cập nhật ACM")
+        # Read-after-write: GET ngay sau apply có thể trả ACM cũ (move_group
+        # xử lý diff bất đồng bộ). Mọi fingerprint/revalidate đọc sau đó sẽ
+        # thấy sai phase (vd. thiếu entry chessboard, board<->piece báo oan).
+        # Chờ tới khi entry đọc về khớp giá trị vừa ghi.
+        self._wait_for_acm_pair(obj_id, gripper_touch, board_contact)
+
+    def _acm_pair_visible(self, obj_id: str, gripper_touch: bool,
+                          board_contact: bool) -> bool:
+        try:
+            scene = self._get_planning_scene(
+                PlanningSceneComponents.ALLOWED_COLLISION_MATRIX)
+        except Exception:
+            return False
+        acm = scene.allowed_collision_matrix
+        if obj_id not in acm.entry_names or "chessboard" not in acm.entry_names:
+            return False
+        names = list(acm.entry_names)
+        try:
+            oi = names.index(obj_id)
+            bi = names.index("chessboard")
+            # GRIPPER_TOUCH_LINKS có thể chưa đủ entry nếu diff cũ; chỉ check
+            # link đầu + board để gate nhanh (đủ bắt race read-after-write).
+            first = GRIPPER_TOUCH_LINKS[0]
+            if first not in names:
+                return False
+            fi = names.index(first)
+            row_o = acm.entry_values[oi].enabled
+            row_b = acm.entry_values[bi].enabled
+            row_f = acm.entry_values[fi].enabled
+        except (IndexError, AttributeError):
+            return False
+        def _at(row, j: int) -> bool:
+            return j < len(row) and bool(row[j])
+        return (_at(row_o, fi) == gripper_touch
+                and _at(row_f, oi) == gripper_touch
+                and _at(row_o, bi) == board_contact
+                and _at(row_b, oi) == board_contact)
+
+    def _wait_for_acm_pair(self, obj_id: str, gripper_touch: bool,
+                           board_contact: bool, timeout_sec: float = 3.0):
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and time.monotonic() < deadline:
+            if self._acm_pair_visible(obj_id, gripper_touch, board_contact):
+                return
+            time.sleep(0.05)
+        self.get_logger().warning(
+            f"[ACM] {obj_id} không thấy visibility sau {timeout_sec:.0f}s "
+            f"(touch={gripper_touch}, board={board_contact}); tiếp tục, "
+            f"check sau có thể đọc phase cũ")
 
     def _set_object_gripper_collision(self, obj_id: str, allow: bool):
         """Compat: bật/tắt cả 2 ngoại lệ cùng lúc.
@@ -1619,11 +1668,26 @@ class PickPlaceNode(Node):
         Scratch và quân đang gắp được loại khỏi fingerprint vì chúng được kiểm
         riêng bằng geometry cố định + T_tcp_piece. Mọi world pose/geometry,
         attached object khác và ACM không liên quan tới quân phải giữ nguyên.
+
+        Đọc 2 lần cách nhau 0.3s: GET ngay sau apply ACM có thể trả snapshot
+        cũ (race read-after-write); nếu 2 lần khác nhau thì lấy lần mới nhất
+        và log để caller biết baseline có churn.
         """
-        scene = self._get_planning_scene(
-            PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
-            | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
-            | PlanningSceneComponents.ALLOWED_COLLISION_MATRIX)
+        def _fetch():
+            return self._get_planning_scene(
+                PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+                | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+                | PlanningSceneComponents.ALLOWED_COLLISION_MATRIX)
+        first = self._scene_fingerprint_of(_fetch(), carried_id)
+        time.sleep(0.3)
+        second = self._scene_fingerprint_of(_fetch(), carried_id)
+        if first != second:
+            self.get_logger().warning(
+                "[CACHED] fingerprint đọc 2 lần khác nhau (scene đang churn); "
+                "dùng snapshot mới nhất")
+        return second
+
+    def _scene_fingerprint_of(self, scene, carried_id: str | None):
         excluded = {"__dry_carry__"}
         if carried_id:
             excluded.add(carried_id)
