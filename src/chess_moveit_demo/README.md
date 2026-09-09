@@ -7,7 +7,7 @@ kiểm tra trọn luồng Stockfish, luật `python-chess`, ACK và visual đủ
 Nó không import hay chạy `pymoveit2`, `move_group` hoặc controller robot:
 
 ```bash
-cd ~/dofbot_tea_chess
+cd ~/dofbot_robot_arm_6dof
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 launch chess_moveit_demo chess_base.launch.py
@@ -49,8 +49,8 @@ chess_brain_node          pick_place_node
 ## Cài đặt (standalone, chỉ cần repo này)
 
 ```bash
-git clone <url> dofbot_tea_chess
-cd dofbot_tea_chess
+git clone <url> dofbot_robot_arm_6dof
+cd dofbot_robot_arm_6dof
 ./setup_standalone.sh   # cài stockfish + python-chess, lấy dofbot_urdf, colcon build
 source install/setup.bash
 ```
@@ -58,7 +58,7 @@ source install/setup.bash
 Build lại sau khi sửa code (chạy tại workspace root):
 
 ```bash
-cd ~/dofbot_tea_chess
+cd ~/dofbot_robot_arm_6dof
 source /opt/ros/humble/setup.bash
 colcon build --packages-select chess_moveit_demo
 source install/setup.bash
@@ -101,7 +101,7 @@ Mỗi terminal đều source trước:
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/dofbot_tea_chess/install/setup.bash
+source ~/dofbot_robot_arm_6dof/install/setup.bash
 ```
 
 Lite sim mặc định (MoveIt + RViz nhẹ):
@@ -110,10 +110,9 @@ Lite sim mặc định (MoveIt + RViz nhẹ):
 ros2 launch chess_moveit_demo chess_sim.launch.py
 ```
 
-RViz mở với robot và đủ bàn cờ, nhưng robot là `dofbot_lite` (14 box primitive
-thay cho mesh STL high-poly) và `MotionPlanning` tắt để tránh render planning
-scene/trajectory nặng (phù hợp máy yếu). Link/joint, IK và collision của MoveIt
-không đổi. Khi cần debug quỹ đạo, tick
+RViz mở với robot và đủ bàn cờ, dùng profile `chess_lite.rviz` (tắt
+`MotionPlanning` trajectory để nhẹ máy) và robot `dofbot.urdf.xacro` đầy đủ.
+Link/joint, IK và collision của MoveIt không đổi. Khi cần debug quỹ đạo, tick
 `MotionPlanning (enable for trajectory)` trong panel **Displays**; FPS sẽ giảm.
 Khi muốn bắt đầu self-play, mở terminal
 khác (đã source workspace) rồi gọi:
@@ -126,8 +125,8 @@ Node brain sẽ publish nước Trắng đầu tiên để robot thực hiện; 
 Đen tự cập nhật trên RViz rồi tới lượt Trắng kế tiếp.
 
 Trước khi bấm `/chess/start`, kiểm tra vùng làm việc của đúng vị trí bàn hiện
-tại (2 tầng: quét nhanh 64 ô + dry-run đúng chuỗi runtime trên 12 ô đại diện
-và khu discard):
+tại (2 tầng: quét nhanh 64 ô + dry-run đúng chuỗi runtime trên 10 ô đại diện
+và 16 slot discard):
 
 ```bash
 ros2 service call /chess/check_reachability std_srvs/srv/Trigger '{}'

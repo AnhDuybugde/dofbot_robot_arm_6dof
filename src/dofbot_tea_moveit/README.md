@@ -25,8 +25,8 @@ tea_backend.launch.py      tea_task.launch.py
 ## Cài đặt (standalone, chỉ cần repo này)
 
 ```bash
-git clone <url> dofbot_tea_chess
-cd dofbot_tea_chess
+git clone <url> dofbot_robot_arm_6dof
+cd dofbot_robot_arm_6dof
 ./setup_standalone.sh   # cài dep, lấy dofbot_urdf, colcon build
 source install/setup.bash
 ```
@@ -34,7 +34,7 @@ source install/setup.bash
 Build lại sau khi sửa code (chạy tại workspace root):
 
 ```bash
-cd ~/dofbot_tea_chess
+cd ~/dofbot_robot_arm_6dof
 source /opt/ros/humble/setup.bash
 colcon build --packages-select dofbot_tea_moveit
 source install/setup.bash
@@ -46,7 +46,7 @@ Mỗi terminal đều source trước:
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/dofbot_tea_chess/install/setup.bash
+source ~/dofbot_robot_arm_6dof/install/setup.bash
 ```
 
 ```bash
@@ -58,11 +58,9 @@ ros2 launch dofbot_tea_moveit tea_task.launch.py
 ros2 launch dofbot_tea_moveit tea_rviz.launch.py
 ```
 
-Toàn bộ launch Tea dùng `dofbot_lite`: 14 box primitive thay cho visual mesh
-STL high-poly; link/joint, collision proxy và MoveIt kinematics không đổi.
-
-`tea_rviz.launch.py` mở `config/tea_view_lite.rviz`: chỉ hiển thị robot và
-proxy primitive nhẹ cho ly/ấm, không render STL gốc gần 500k triangles. Scene
+Launch Tea dùng robot `dofbot.urdf.xacro` đầy đủ; RViz dùng profile lite
+`tea_view_lite.rviz`: chỉ hiển thị robot và proxy primitive nhẹ cho ly/ấm,
+không render STL gốc gần 500k triangles. Scene
 chỉ publish khi task thay đổi trạng thái, nên không có redraw định kỳ lúc idle.
 Khi cần debug quỹ đạo, bật display `MotionPlanning (enable for trajectory)`
 trong profile lite; nó tắt mặc định để giữ FPS.
