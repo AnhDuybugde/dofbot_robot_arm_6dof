@@ -2753,6 +2753,13 @@ class PickPlaceNode(Node):
             self._carry_state = "ATTACH_PENDING"
             self._attach_piece(obj_id, piece_type, square_to_xy(from_sq))
             self._carry_state = "ATTACHED"
+            # Chốt lại phase ACM sau attach: quân ở mặt bàn nên gripper_touch
+            # và board_contact đều MỞ. Re-assert để chữa update ACM mất lúc
+            # precheck scratch xen kẽ; revalidate lift cached ngay sau đây phụ
+            # thuộc đúng phase này (board<->piece ở pose gắp là tiếp xúc hợp
+            # lệ, không phải collision).
+            self._set_piece_collision(
+                obj_id, gripper_touch=True, board_contact=True)
             dest_piece = placed_piece_type or piece_type
             verified_quat = (verified or {}).get("place_quat")
             # Ưu tiên execute đúng chuỗi trajectory đã PASS precheck (giữ nhánh
@@ -2835,6 +2842,9 @@ class PickPlaceNode(Node):
             self._carry_state = "ATTACH_PENDING"
             self._attach_piece(obj_id, piece_type, square_to_xy(square))
             self._carry_state = "ATTACHED"
+            # Chốt lại phase ACM sau attach (lý do như _do_pick_place).
+            self._set_piece_collision(
+                obj_id, gripper_touch=True, board_contact=True)
             verified_quat = (verified or {}).get("place_quat")
             drop_tcp, _cached_where = self._try_execute_cached_carry_chain(
                 verified, obj_id, piece_type, (xd, yd),
@@ -2928,6 +2938,11 @@ class PickPlaceNode(Node):
         if source_obj_id is None:
             source_obj_id = self.piece_id_by_square.get(square)
         errors = []
+        # TODO-3: giữ nghiệm tilt thấp nhất thay vì chốt offset đầu tiên qua
+        # precheck; last_tried_offset để biết arm đang đứng ở đâu khi cần quay
+        # lại pose gắp của best.
+        best = None
+        last_tried_offset = None
         search_deadline = time.monotonic() + GRASP_SEARCH_TIMEOUT_SEC
         for index, offset in enumerate(self._grasp_offset_candidates(square), 1):
             if time.monotonic() >= search_deadline:
@@ -2967,6 +2982,7 @@ class PickPlaceNode(Node):
                 )
                 continue
             self._execute_and_wait(self.moveit2, descend_trajectory)
+            last_tried_offset = offset
             # T_tcp_piece giả định của đúng offset đang thử, đo tại TF descend
             # hiện tại (kẹp vẫn mở, chưa attach gì). Mọi precheck có mang bên
             # dưới dùng đúng transform này.
@@ -3027,17 +3043,48 @@ class PickPlaceNode(Node):
                     continue
             self._grasp_offset_cache[square] = offset
             if verified is not None:
-                self.get_logger().info(
-                    f"[GRASP-CANDIDATE] {square} chọn offset={offset} "
-                    f"+ nghiệm đặt bù tâm sau {index} lần thử "
-                    f"(lệch {verified['pos_err'] * 1000:.1f}mm "
-                    f"tilt {math.degrees(verified['tilt']):.1f}° ở precheck)"
-                )
+                tilt = float(verified.get("tilt", 0.0))
+                if tilt <= PREFERRED_TILT_RAD:
+                    self.get_logger().info(
+                        f"[GRASP-CANDIDATE] {square} chọn offset={offset} "
+                        f"+ nghiệm đặt bù tâm sau {index} lần thử "
+                        f"(lệch {verified['pos_err'] * 1000:.1f}mm "
+                        f"tilt {math.degrees(tilt):.1f}° ở precheck)"
+                    )
+                    return x, y, z, lift_z, grasp_q, verified
+                # TODO-3: không chốt offset đầu tiên qua precheck; giữ nghiệm
+                # tilt thấp nhất (vd. e4 offset(0,0) cho tilt 39.7° ở a1 —
+                # chốt ngay sẽ đẩy failure sang runtime). Thoát sớm chỉ khi
+                # đã đạt target 11°.
+                if best is None or tilt < best[0]:
+                    best = (tilt, offset, x, y, z, lift_z, grasp_q, verified)
+                    self.get_logger().info(
+                        f"[GRASP-CANDIDATE] {square} offset={offset} tạm giữ "
+                        f"(tilt {math.degrees(tilt):.1f}°), tìm tiếp offset "
+                        f"tilt thấp hơn")
+                continue
             else:
                 self.get_logger().info(
                     f"[GRASP-CANDIDATE] {square} chọn offset={offset} "
                     f"sau {index} lần thử"
                 )
+                return x, y, z, lift_z, grasp_q, verified
+        if best is not None:
+            tilt, offset, x, y, z, lift_z, grasp_q, verified = best
+            self._grasp_offset_cache[square] = offset
+            self.get_logger().info(
+                f"[GRASP-CANDIDATE] {square} chọn offset={offset} "
+                f"(tilt thấp nhất {math.degrees(tilt):.1f}° ở precheck)")
+            if offset != last_tried_offset:
+                # Arm đang đứng ở offset thử cuối, không phải offset tốt nhất:
+                # về lại pose gắp của best trước khi attach (verified chain
+                # được plan từ đúng pose này; gate cached dung sai 4mm/8°).
+                self.get_logger().info(
+                    f"[GRASP-CANDIDATE] {square} quay lại pose gắp của "
+                    f"offset tốt nhất {offset}")
+                self._execute_grasp_pose(x, y, z, approach_tcp_z(square, z),
+                                         step_name)
+                grasp_q = self._current_tcp_quat()
             return x, y, z, lift_z, grasp_q, verified
         raise RuntimeError(
             f"Không có approach gắp an toàn cho {square} sau {len(errors)} candidate; "
@@ -3604,6 +3651,20 @@ class PickPlaceNode(Node):
                     except Exception:
                         break
                     if pos_err <= PLACE_POSITION_TOL_M:
+                        # TODO-2/3: tilt > 26° là hard-reject ngay cả ở precheck.
+                        # Chấp nhận nghiệm nghiêng 40° ở đây chỉ đẩy failure sang
+                        # runtime (cached reuse rớt, compensation không hội tụ)
+                        # với log khó hiểu. Thử yaw kế thay vì chốt.
+                        if tilt > MAX_ACCEPTED_TILT_RAD:
+                            self._last_chain_failure_reason = (
+                                f"nghiệm đạt tâm nhưng tilt "
+                                f"{math.degrees(tilt):.1f}° > hard "
+                                f"{math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°")
+                            self.get_logger().warning(
+                                f"[CHAIN] {context}: loại yaw (tilt "
+                                f"{math.degrees(tilt):.1f}° vượt hard limit) "
+                                f"-> thử yaw kế")
+                            break
                         # Quaternion thực tế của endpoint, chỉ dùng để retreat
                         # giữ pose hiện tại; không phải constraint của quân.
                         place_tcp = (px, py, pz, fq)
@@ -3611,7 +3672,9 @@ class PickPlaceNode(Node):
                             f"[CHAIN] {context}: bù tâm FK đạt sau "
                             f"{correction + 1}/{PLACE_COMPENSATION_MAX_ITERATIONS} "
                             f"lần, lệch {pos_err * 1000:.1f}mm; "
-                            f"tilt tham khảo {math.degrees(tilt):.1f}°")
+                            f"tilt {math.degrees(tilt):.1f}° "
+                            f"(target <={math.degrees(PREFERRED_TILT_RAD):.0f}°, "
+                            f"hard <={math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°)")
                         return {"lift": lift, "transfer": transfer,
                                 "pre": pre, "desc": desc,
                                 "hypo_local": copy.deepcopy(hypo_local),
@@ -3631,9 +3694,10 @@ class PickPlaceNode(Node):
                 f"[CHAIN] {context}: lift + transfer đạt nhưng bù tâm FK "
                 f"không hội tụ sau {PLACE_COMPENSATION_MAX_ITERATIONS} lần "
                 f"-> loại offset")
-            self._last_chain_failure_reason = (
-                "bù tâm FK/pre-place→descend không hội tụ sau "
-                f"{PLACE_COMPENSATION_MAX_ITERATIONS} lần")
+            if not getattr(self, "_last_chain_failure_reason", "").startswith("nghiệm đạt tâm nhưng tilt"):
+                self._last_chain_failure_reason = (
+                    "bù tâm FK/pre-place→descend không hội tụ sau "
+                    f"{PLACE_COMPENSATION_MAX_ITERATIONS} lần")
             return None
         finally:
             self._dry_detach_scratch(
@@ -3673,6 +3737,24 @@ class PickPlaceNode(Node):
             f"(lệch {position_error:.4f}m); góc nghiêng tham khảo "
             f"(không dùng để FAIL)={math.degrees(tilt):.1f}deg. "
             f"Khả năng: TCP compensation chưa khớp orientation FK thực tế.")
+
+    def _execute_grasp_pose(self, x, y, z, approach_z: float, step_name: str):
+        """Về lại pose gắp (approach OMPL + descend Cartesian) của offset tốt
+        nhất sau khi đã thử các offset khác. Raise nếu không plan được để
+        caller NACK thay vì attach ở pose sai."""
+        approach_trajectory = self._plan_motion(
+            position=[x, y, approach_z], target_link=END_EFFECTOR,
+            tolerance_position=0.004, cartesian=False)
+        if approach_trajectory is None:
+            raise RuntimeError(
+                f"không plan được approach khi quay lại offset tốt nhất {(x, y)}")
+        self._execute_and_wait(self.moveit2, approach_trajectory)
+        grasp_q = self._current_tcp_quat()
+        descend_trajectory = self._plan_vertical_trajectory(x, y, z, grasp_q, step_name)
+        if descend_trajectory is None:
+            raise RuntimeError(
+                f"không có Cartesian descend khi quay lại offset tốt nhất {(x, y)}")
+        self._execute_and_wait(self.moveit2, descend_trajectory)
 
     def _move_vertical(self, x, y, z, step_name: str, quat_xyzw=None):
         """Đi thẳng đứng bằng compute_cartesian_path, không để OMPL lách qua
@@ -3832,10 +3914,38 @@ class PickPlaceNode(Node):
         contacts = sorted({
             f"{c.contact_body_1}<->{c.contact_body_2}" for c in result.contacts
         })
+        # Phân biệt va chạm thật với cặp đã cho phép bởi ACM (update ACM mất
+        # hoặc chưa propagate sẽ báo oan cặp hợp lệ như board<->piece ở pose
+        # gắp). Chỉ query ACM trên nhánh fail để không tốn service call.
+        annotated = []
+        allowed_map = self._acm_allowed_map()
+        for pair in contacts:
+            a, b = pair.split("<->", 1)
+            if allowed_map.get((a, b), allowed_map.get((b, a), False)):
+                annotated.append(f"{pair}(ACM-cho-phep?)")
+            else:
+                annotated.append(pair)
         self.get_logger().warning(
             f"[CACHED] {context}: waypoint collision"
-            + (f" ({', '.join(contacts)})" if contacts else ""))
+            + (f" ({', '.join(annotated)})" if annotated else ""))
         return False
+
+    def _acm_allowed_map(self) -> dict:
+        """Đọc ACM hiện tại thành map cặp cho phép (best-effort, fail -> {})."""
+        try:
+            scene = self._get_planning_scene(
+                PlanningSceneComponents.ALLOWED_COLLISION_MATRIX)
+        except Exception:
+            return {}
+        acm = scene.allowed_collision_matrix
+        names = list(acm.entry_names)
+        allowed: dict = {}
+        for i, left in enumerate(names):
+            row = acm.entry_values[i].enabled if i < len(acm.entry_values) else []
+            for j, right in enumerate(names):
+                if j < len(row) and bool(row[j]):
+                    allowed[(left, right)] = True
+        return allowed
 
     def _cached_trajectory_collision_free(self, trajectory,
                                           context: str) -> bool:
