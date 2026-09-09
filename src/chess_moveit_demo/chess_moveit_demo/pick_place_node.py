@@ -793,29 +793,30 @@ class PickPlaceNode(Node):
                     pass
 
     def _setup_initial_scene_incremental(self):
-        """Fallback: thêm từng object qua topic (cách cũ, chậm hơn nhưng đã
-        chứng minh chạy được khi service apply flake lúc khởi động)."""
-        if COLLISION_ENABLED:
-            self.moveit2.add_collision_box(
-                id="chessboard",
-                position=[BOARD_CENTER_X, BOARD_CENTER_Y, BOARD_CENTER_Z],
-                quat_xyzw=[0.0, 0.0, 0.0, 1.0],
-                size=[BOARD_SIZE_X, BOARD_SIZE_Y, BOARD_THICKNESS],
-            )
-            for square, obj_id in self.piece_id_by_square.items():
-                ptype, _color = self.piece_info_by_id[obj_id]
-                self._add_piece_collision_at(obj_id, (*square_to_xy(square), BOARD_Z), ptype)
-            # Chờ scene nhận đủ rồi mới verify ở caller.
-            deadline = time.monotonic() + 20.0
-            while time.monotonic() < deadline:
-                try:
-                    _a, world = self._scene_object_ids()
-                    if "chessboard" in world and sum(
-                            1 for i in world if i.startswith("piece_")) >= 32:
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.3)
+        """Fallback incremental có xác minh từng bước (TODO-1).
+
+        Burst 33 object liên tiếp từng làm rơi object (RViz update storm +
+        scene monitor nuốt diff). Thứ tự: thêm board -> chờ scene thấy board ->
+        thêm từng quân một -> xác minh ID vừa thêm trước khi tiếp tục. Cuối
+        cùng caller vẫn verify toàn bộ 33/33 + pose + geometry.
+        """
+        if not COLLISION_ENABLED:
+            return
+        self.moveit2.add_collision_box(
+            id="chessboard",
+            position=[BOARD_CENTER_X, BOARD_CENTER_Y, BOARD_CENTER_Z],
+            quat_xyzw=[0.0, 0.0, 0.0, 1.0],
+            size=[BOARD_SIZE_X, BOARD_SIZE_Y, BOARD_THICKNESS],
+        )
+        self._wait_for_scene_object("chessboard", attached=False, timeout_sec=10.0)
+        n = 0
+        for square, obj_id in self.piece_id_by_square.items():
+            ptype, _color = self.piece_info_by_id[obj_id]
+            self._add_piece_collision_at(obj_id, (*square_to_xy(square), BOARD_Z), ptype)
+            self._wait_for_scene_object(obj_id, attached=False, timeout_sec=10.0)
+            n += 1
+            if n % 8 == 0:
+                self.get_logger().info(f"[SCENE] fallback incremental: {n}/32 quân đã vào scene")
 
     def _add_piece_collision(self, square: str, piece: chess.Piece, publish: bool = True):
         obj_id = self._new_piece_id()
