@@ -93,6 +93,7 @@ from .chess_utils import (
     SCENE_VERIFY_POS_TOL_M,
     SQUARE_SIZE,
     SYSTEM_READY_TIMEOUT_SEC,
+    SYSTEM_READY_RETRY_SEC,
     SYSTEM_READY_TOPIC,
     TILT_HARD_LIMIT_RAD,
     TILT_QUALITY_TARGET_RAD,
@@ -324,14 +325,50 @@ class PickPlaceNode(Node):
         self._state_validity_client.wait_for_service(timeout_sec=10.0)
         self._ik_client.wait_for_service(timeout_sec=10.0)
 
-        self._setup_initial_scene()
-        # TODO-1: gate READY có timeout + log rõ điều kiện fail, thay vì coi
-        # scene setup xong là sẵn sàng. Brain chờ topic này, không còn timer.
-        self._wait_for_system_ready(timeout_sec=SYSTEM_READY_TIMEOUT_SEC)
+        # TODO-1: dựng scene + gate READY trên thread nền. Service
+        # /apply_planning_scene và /get_planning_scene cần executor đang spin
+        # mới hoàn thành future; gọi đồng bộ ngay trong __init__ (trước
+        # executor.spin() ở main) sẽ treo vì không ai xử lý response.
+        # Brain đã chờ topic /chess/system_ready nên init async là an toàn.
+        self._init_error: str | None = None
+        threading.Thread(target=self._init_scene_and_ready, daemon=True).start()
         self.get_logger().info(
-            f"Pick-place node sẵn sàng; collision={'ON' if COLLISION_ENABLED else 'OFF'}, "
+            f"Pick-place node khởi động (đang dựng scene nền); "
+            f"collision={'ON' if COLLISION_ENABLED else 'OFF'}, "
             f"deep-check={'EXECUTE' if REACHABILITY_EXECUTE_ON_FAKESYSTEM else 'plan-only'}."
         )
+
+    def _init_scene_and_ready(self):
+        deadline = time.monotonic() + SYSTEM_READY_TIMEOUT_SEC
+        attempt = 0
+        while rclpy.ok() and time.monotonic() < deadline:
+            attempt += 1
+            try:
+                self._setup_initial_scene()
+                # Gate READY có timeout + log rõ điều kiện fail, thay vì coi
+                # scene setup xong là sẵn sàng. Brain chờ topic này.
+                self._wait_for_system_ready(
+                    timeout_sec=min(60.0, max(5.0, deadline - time.monotonic())))
+            except Exception as exc:
+                self._init_error = str(exc)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.get_logger().warning(
+                    f"[INIT-RETRY] lần {attempt} thất bại ({exc}); "
+                    f"thử lại sau {SYSTEM_READY_RETRY_SEC:.0f}s "
+                    f"(còn {remaining:.0f}s)")
+                time.sleep(min(SYSTEM_READY_RETRY_SEC, remaining))
+                continue
+            else:
+                self._init_error = None
+                self.get_logger().info(
+                    f"Pick-place node sẵn sàng; collision={'ON' if COLLISION_ENABLED else 'OFF'}, "
+                    f"deep-check={'EXECUTE' if REACHABILITY_EXECUTE_ON_FAKESYSTEM else 'plan-only'}."
+                )
+                return
+        self.get_logger().error(
+            f"[FAIL] init scene/READY thất bại sau {attempt} lần thử: {self._init_error}")
 
     def _on_joint_state(self, msg: JointState):
         self._last_joint_state_time = time.monotonic()
@@ -384,21 +421,47 @@ class PickPlaceNode(Node):
             objects.append(obj)
         return objects
 
-    def _apply_initial_scene_once(self, objects: list[CollisionObject]):
-        """Gửi toàn bộ scene bằng MỘT lần /apply_planning_scene (TODO-1)."""
-        req = ApplyPlanningScene.Request()
-        req.scene.is_diff = True
-        req.scene.world.collision_objects = objects
-        req.scene.robot_state.is_diff = True
-        future = self._apply_scene_client.call_async(req)
-        deadline = time.monotonic() + 10.0
-        while not future.done():
-            if time.monotonic() >= deadline:
-                raise RuntimeError("apply_planning_scene timeout khi dựng scene ban đầu")
-            time.sleep(0.02)
-        result = future.result()
-        if result is None or not result.success:
-            raise RuntimeError("apply_planning_scene từ chối scene ban đầu")
+    def _apply_initial_scene_once(self, objects: list[CollisionObject],
+                                    attempts: int = 3, timeout_each: float = 15.0):
+        """Gửi toàn bộ scene bằng MỘT lần /apply_planning_scene (TODO-1).
+
+        Retry với backoff vì request đầu sau launch có thể rớt trong lúc
+        move_group còn khởi tạo scene monitor. Hết attempts thì raise để caller
+        fallback incremental (topic) thay vì kẹt init.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            req = ApplyPlanningScene.Request()
+            req.scene.is_diff = True
+            req.scene.world.collision_objects = objects
+            req.scene.robot_state.is_diff = True
+            future = self._apply_scene_client.call_async(req)
+            deadline = time.monotonic() + timeout_each
+            while not future.done():
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            if future.done():
+                result = future.result()
+                if result is not None and result.success:
+                    if attempt > 1:
+                        self.get_logger().warning(
+                            f"[SCENE] apply nguyên tử đạt ở lần thử {attempt}")
+                    return
+                last_exc = RuntimeError(
+                    "apply_planning_scene từ chối scene ban đầu")
+            else:
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+                last_exc = RuntimeError(
+                    f"apply_planning_scene timeout ({timeout_each:.0f}s) "
+                    f"lần {attempt}/{attempts}")
+                self.get_logger().warning(f"[SCENE] {last_exc}; thử lại...")
+                time.sleep(1.0)
+        raise last_exc if last_exc is not None else RuntimeError(
+            "apply_planning_scene thất bại không rõ nguyên nhân")
 
     def _verify_initial_scene(self) -> list[str]:
         """Đọc lại scene và verify 33/33, ID, geometry, pose, dup, attached rỗng.
@@ -652,7 +715,10 @@ class PickPlaceNode(Node):
         """Dựng scene chuẩn 33/33 bằng MỘT lần /apply_planning_scene (TODO-1).
 
         Visual vẫn publish 1 snapshot duy nhất để tránh RViz update storm.
+        Idempotent: mỗi lần retry đều dọn object cờ cũ (best-effort, qua topic)
+        trước khi dựng lại để không nhân đôi world objects.
         """
+        self._clear_chess_scene_objects()
         self._publish_board_visual(publish=False)
         # Dựng mapping nội bộ trước để _build_* dùng piece_map chuẩn.
         self.piece_id_by_square.clear()
@@ -670,7 +736,15 @@ class PickPlaceNode(Node):
             self._publish_all_visual()
             return
         objects = self._build_initial_collision_objects()
-        self._apply_initial_scene_once(objects)
+        try:
+            self._apply_initial_scene_once(objects)
+        except Exception as exc:
+            # Fallback incremental qua topic (cách cũ đã chứng minh chạy được):
+            # vẫn verify 33/33 đọc lại phía dưới nên không mất gate TODO-1.
+            self.get_logger().warning(
+                f"[SCENE] apply nguyên tử thất bại ({exc}); "
+                f"fallback incremental từng object qua topic")
+            self._setup_initial_scene_incremental()
         # Visual cho từng quân từ mapping vừa dựng (không add collision lần 2).
         for square, obj_id in self.piece_id_by_square.items():
             self._publish_piece_visual(
@@ -681,6 +755,46 @@ class PickPlaceNode(Node):
         if reasons:
             raise RuntimeError(
                 "scene ban đầu chưa đạt 33/33: " + "; ".join(reasons))
+
+    def _clear_chess_scene_objects(self):
+        """Dọn object cờ cũ trước khi dựng lại (best-effort, không raise)."""
+        if not COLLISION_ENABLED:
+            return
+        try:
+            _attached, world_ids = self._scene_object_ids()
+        except Exception:
+            return
+        for oid in list(world_ids):
+            if oid == "chessboard" or oid.startswith("piece_") or oid.startswith("__dry_"):
+                try:
+                    self.moveit2.remove_collision_object(id=oid)
+                except Exception:
+                    pass
+
+    def _setup_initial_scene_incremental(self):
+        """Fallback: thêm từng object qua topic (cách cũ, chậm hơn nhưng đã
+        chứng minh chạy được khi service apply flake lúc khởi động)."""
+        if COLLISION_ENABLED:
+            self.moveit2.add_collision_box(
+                id="chessboard",
+                position=[BOARD_CENTER_X, BOARD_CENTER_Y, BOARD_CENTER_Z],
+                quat_xyzw=[0.0, 0.0, 0.0, 1.0],
+                size=[BOARD_SIZE_X, BOARD_SIZE_Y, BOARD_THICKNESS],
+            )
+            for square, obj_id in self.piece_id_by_square.items():
+                ptype, _color = self.piece_info_by_id[obj_id]
+                self._add_piece_collision_at(obj_id, (*square_to_xy(square), BOARD_Z), ptype)
+            # Chờ scene nhận đủ rồi mới verify ở caller.
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                try:
+                    _a, world = self._scene_object_ids()
+                    if "chessboard" in world and sum(
+                            1 for i in world if i.startswith("piece_")) >= 32:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.3)
 
     def _add_piece_collision(self, square: str, piece: chess.Piece, publish: bool = True):
         obj_id = self._new_piece_id()

@@ -167,7 +167,11 @@ SYSTEM_READY_TOPIC = "/chess/system_ready"
 # /joint_states coi là stale nếu không có mẫu mới trong cửa sổ này.
 JOINT_STATE_MAX_AGE_SEC = 1.0
 # Thời gian tối đa chờ hạ tầng READY sau khi dựng scene (log rõ điều kiện fail).
-SYSTEM_READY_TIMEOUT_SEC = 60.0
+# move_group trên máy yếu cần vài phút để load xong pipeline mới serve service
+# (advertise sớm nhưng request tới sớm sẽ timeout), nên trần phải rộng và init
+# retry vòng lặp thay vì thử một lần.
+SYSTEM_READY_TIMEOUT_SEC = 600.0
+SYSTEM_READY_RETRY_SEC = 10.0
 # Sai số cho phép khi verify pose scene đọc lại (tâm cylinder so với kỳ vọng).
 SCENE_VERIFY_POS_TOL_M = 0.005
 # Joint limits Dofbot 5-DOF (rad) để gate candidate quá sát limit (TODO-2).
