@@ -59,9 +59,15 @@ from .chess_utils import (
     BOARD_THICKNESS,
     BOARD_TOP_Z,
     BOARD_Z,
+    CANDIDATE_SCORE_W_LIMIT_MARGIN,
+    CANDIDATE_SCORE_W_POS,
+    CANDIDATE_SCORE_W_TILT,
+    CANDIDATE_SCORE_W_TRAVEL,
     CARTESIAN_EEF_STEP,
     DISCARD_MAX_SLOTS,
     DISCARD_TCP_Z,
+    DOFBOT_JOINT_LIMITS,
+    EXPECTED_WORLD_OBJECTS,
     FINGER_THICKNESS,
     FINAL_GRASP_INNER_WIDTH,
     GRASP_APPROACH_CANDIDATE_OFFSETS,
@@ -69,16 +75,28 @@ from .chess_utils import (
     GRASP_SEARCH_TIMEOUT_SEC,
     GRIPPER_CLOSED_RAD,
     GRIPPER_OPEN_RAD,
+    HARDWARE_SAFE_VELOCITY_SCALE,
     HIGH_APPROACH_INNER_WIDTH,
+    JOINT_LIMIT_MARGIN_RAD,
+    JOINT_STATE_MAX_AGE_SEC,
+    MAX_JOINT_STEP_RAD,
     MIN_CARTESIAN_FRACTION,
     NARROW_DESCENT_INNER_WIDTH,
     PICK_TCP_Z,
     PIECE_COLLISION,
     PIECE_PHYSICAL,
     PIECE_SPECS,
+    TCP_OFFSET_CALIBRATED,
     COLLISION_ENABLED,
     REACHABILITY_EXECUTE_ON_FAKESYSTEM,
+    REGION_JOINT_TEMPLATES,
+    SCENE_VERIFY_POS_TOL_M,
     SQUARE_SIZE,
+    SYSTEM_READY_TIMEOUT_SEC,
+    SYSTEM_READY_TOPIC,
+    TILT_HARD_LIMIT_RAD,
+    TILT_QUALITY_TARGET_RAD,
+    USE_UPRIGHT_ORIENTATION_CONSTRAINT,
     VERTICAL_CLEARANCE,
     approach_tcp_z,
     discard_slot_pose,
@@ -86,6 +104,13 @@ from .chess_utils import (
     square_to_place_pose,
     square_to_xy,
 )
+
+try:
+    from controller_manager_msgs.srv import ListControllers
+    _HAS_LIST_CONTROLLERS = True
+except Exception:  # package vắng trên máy chỉ chạy base demo
+    ListControllers = None  # type: ignore
+    _HAS_LIST_CONTROLLERS = False
 
 # Dofbot: 5 joints arm (arm_group) + 1 gripper joint (grip_group, mimic).
 # Tên repo "6dof" = 5+1. Đã đối chiếu SRDF arm_group/up = [0,0,0,0,0].
@@ -108,18 +133,18 @@ GRIPPER_TOUCH_LINKS = [
 # mỗi lượt robot. Đây là joint-goal (PTP), không phải Cartesian target.
 HOME_JOINTS = [0.0, 0.0, 0.0, 0.0, 0.0]
 # Không thử nhiều yaw: IK position-only của Dofbot bỏ qua quaternion nên 8 yaw
-# thường cùng rơi vào một orientation FK. Một candidate ban đầu sẽ được bù XYZ
-# lặp theo chính FK endpoint cho tới khi tâm quân đạt yêu cầu.
-# PLACE_YAW_COUNT=1 có chủ ý (không phải TODO): verified_quat sort bên dưới là
-# no-op với 1 candidate, giữ tham số để tương thích caller cũ.
+# thường cùng rơi vào một orientation FK. TODO-2 thay bằng candidate IK hữu hạn:
+# mỗi pre-place sinh nhiều joint-seed theo vùng bàn cờ + yaw quanh trục đứng,
+# descend Cartesian từ chính từng candidate rồi chấm điểm chọn tốt nhất.
+# PLACE_YAW_COUNT giữ tương thích API cũ; CANDIDATE_YAW_COUNT là số yaw thật
+# mà bộ chọn candidate dùng.
 PLACE_YAW_COUNT = 1
+CANDIDATE_YAW_COUNT = 4
 PLACE_YAW_STEP_DEG = 45.0  # không dùng khi YAW_COUNT=1, giữ để khỏi sửa caller
-# Chỉ tâm quân quyết định PASS khi đặt. Tilt là BỘ LỌC MỀM (không phải path
-# constraint — arm 5DOF + position-only IK không khóa quaternion tuyệt đối):
-# <0.20 rad rất tốt (thoát sớm), 0.20-0.45 chấp nhận nếu collision-free,
-# >0.45 từ chối và thử nghiệm IK khác. Đo bằng FK endpoint, log RViz để đo.
-PREFERRED_TILT_RAD = 0.20
-MAX_ACCEPTED_TILT_RAD = 0.45
+# TODO-3: quality target tilt <= 11° (KPI, chưa blocker MVP), hard limit 26°.
+# Mọi candidate tilt > 26° bị hard-reject; tilt <= 11° được cộng điểm chất lượng.
+PREFERRED_TILT_RAD = TILT_QUALITY_TARGET_RAD
+MAX_ACCEPTED_TILT_RAD = TILT_HARD_LIMIT_RAD
 PLACE_POSITION_TOL_M = 0.005
 # Sau detach giữ touch ACM trong lúc retreat; chỉ đóng khi TCP đã cách quân
 # đủ xa. Retreat hiện tại 65mm >> ngưỡng 10mm nên luôn thỏa, hằng số này để
@@ -227,11 +252,47 @@ class PickPlaceNode(Node):
         # NACK: mọi lỗi thực thi đều báo về brain để dừng chờ ACK, thay vì treo
         # game âm thầm (brain chờ ACK vô hạn). Format: "<uci>: <lý do>".
         self.fail_pub = self.create_publisher(String, "/chess/move_failed", 10)
+        # TODO-1: tín hiệu READY latch cho brain (thay timer 12s cố định).
+        self.ready_pub = self.create_publisher(
+            String,
+            SYSTEM_READY_TOPIC,
+            QoSProfile(
+                depth=1,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=ReliabilityPolicy.RELIABLE,
+            ),
+        )
+        self._system_ready = False
+        self._ready_since: float | None = None
+        # Freshness /joint_states (TODO-1): pymoveit2 đã subscribe nhưng không
+        # lưu timestamp; node tự subscribe thêm để gate READY.
+        self._last_joint_state_time: float | None = None
+        self._joint_state_sub = self.create_subscription(
+            JointState, "/joint_states", self._on_joint_state,
+            10, callback_group=cb_group,
+        )
+        if _HAS_LIST_CONTROLLERS:
+            self._list_controllers_client = self.create_client(
+                ListControllers, "/controller_manager/list_controllers",
+                callback_group=cb_group,
+            )
+        else:
+            self._list_controllers_client = None
         # Guard race: on_move spawn thread mỗi message; 2 thread _execute_move
         # song song sẽ xé board/piece maps dùng chung. Flow chuẩn đã ACK-gated
         # nên cờ này chỉ chặn publish thủ công chồng lệnh.
         self._exec_lock = threading.Lock()
         self._executing = False
+        # TODO-6: log tái hiện ván (seed, move list, candidate, snapshot).
+        self._run_seed = int(time.time() * 1000) % 100000
+        self._run_moves: list[dict] = []
+        self._last_place_choice: dict | None = None
+        self._last_place_region: str | None = None
+        self._last_place_seed_count: int | None = None
+        # TODO-7: param an toàn phần cứng (tốc độ thấp, e-stop ngoài).
+        self.declare_parameter(
+            "hardware_safe_velocity_scale", HARDWARE_SAFE_VELOCITY_SCALE)
+        self.declare_parameter("hardware_low_speed_test", True)
         self.move_sub = self.create_subscription(
             String, "/chess/move", self.on_move, 10, callback_group=cb_group
         )
@@ -264,10 +325,323 @@ class PickPlaceNode(Node):
         self._ik_client.wait_for_service(timeout_sec=10.0)
 
         self._setup_initial_scene()
+        # TODO-1: gate READY có timeout + log rõ điều kiện fail, thay vì coi
+        # scene setup xong là sẵn sàng. Brain chờ topic này, không còn timer.
+        self._wait_for_system_ready(timeout_sec=SYSTEM_READY_TIMEOUT_SEC)
         self.get_logger().info(
             f"Pick-place node sẵn sàng; collision={'ON' if COLLISION_ENABLED else 'OFF'}, "
             f"deep-check={'EXECUTE' if REACHABILITY_EXECUTE_ON_FAKESYSTEM else 'plan-only'}."
         )
+
+    def _on_joint_state(self, msg: JointState):
+        self._last_joint_state_time = time.monotonic()
+
+    # ---------------- TODO-1: PlanningScene nguyên tử + READY gate ----------------
+
+    def _build_initial_collision_objects(self) -> list[CollisionObject]:
+        """Dựng 1 board box + 32 cylinder quân, chưa gửi (để gửi 1 lần)."""
+        from moveit_msgs.msg import CollisionObject as CO
+        from shape_msgs.msg import SolidPrimitive as SP
+        objects: list[CO] = []
+        board = CO()
+        board.header.frame_id = BASE_LINK
+        board.id = "chessboard"
+        board.operation = CollisionObject.ADD
+        prim = SP()
+        prim.type = SolidPrimitive.BOX
+        prim.dimensions = [BOARD_SIZE_X, BOARD_SIZE_Y, BOARD_THICKNESS]
+        board.primitives = [prim]
+        board.primitive_poses = [Pose()]
+        board.primitive_poses[0].position.x = BOARD_CENTER_X
+        board.primitive_poses[0].position.y = BOARD_CENTER_Y
+        board.primitive_poses[0].position.z = BOARD_CENTER_Z
+        board.primitive_poses[0].orientation.w = 1.0
+        board.pose.orientation.w = 1.0
+        objects.append(board)
+        for square, piece in self.board.piece_map().items():
+            name = chess.square_name(square)
+            ptype = piece.symbol().lower()
+            obj_id = self._new_piece_id()
+            self.piece_id_by_square[name] = obj_id
+            self.piece_info_by_id[obj_id] = (ptype, piece.color)
+            x, y = square_to_xy(name)
+            col = PIECE_COLLISION[ptype]
+            obj = CO()
+            obj.header.frame_id = BASE_LINK
+            obj.id = obj_id
+            obj.operation = CollisionObject.ADD
+            cyl = SP()
+            cyl.type = SolidPrimitive.CYLINDER
+            cyl.dimensions = [col["height"], col["radius"]]
+            obj.primitives = [cyl]
+            pose = Pose()
+            pose.position.x = x
+            pose.position.y = y
+            pose.position.z = BOARD_Z + col["height"] / 2
+            pose.orientation.w = 1.0
+            obj.primitive_poses = [pose]
+            obj.pose.orientation.w = 1.0
+            objects.append(obj)
+        return objects
+
+    def _apply_initial_scene_once(self, objects: list[CollisionObject]):
+        """Gửi toàn bộ scene bằng MỘT lần /apply_planning_scene (TODO-1)."""
+        req = ApplyPlanningScene.Request()
+        req.scene.is_diff = True
+        req.scene.world.collision_objects = objects
+        req.scene.robot_state.is_diff = True
+        future = self._apply_scene_client.call_async(req)
+        deadline = time.monotonic() + 10.0
+        while not future.done():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("apply_planning_scene timeout khi dựng scene ban đầu")
+            time.sleep(0.02)
+        result = future.result()
+        if result is None or not result.success:
+            raise RuntimeError("apply_planning_scene từ chối scene ban đầu")
+
+    def _verify_initial_scene(self) -> list[str]:
+        """Đọc lại scene và verify 33/33, ID, geometry, pose, dup, attached rỗng.
+
+        Trả về danh sách lý do chưa đạt (rỗng = đạt).
+        """
+        reasons: list[str] = []
+        try:
+            scene = self._get_planning_scene(
+                PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+                | PlanningSceneComponents.WORLD_OBJECT_NAMES
+                | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+                | PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+            )
+        except Exception as exc:
+            return [f"get_planning_scene lỗi: {exc}"]
+        world = list(scene.world.collision_objects)
+        attached = list(scene.robot_state.attached_collision_objects)
+        if attached:
+            reasons.append(
+                f"attached objects ban đầu phải rỗng, thấy {len(attached)}")
+        if len(world) != EXPECTED_WORLD_OBJECTS:
+            reasons.append(
+                f"world objects {len(world)}/{EXPECTED_WORLD_OBJECTS}")
+        ids = [o.id for o in world]
+        if len(set(ids)) != len(ids):
+            reasons.append("trùng ID trong world objects")
+        idset = set(ids)
+        if "chessboard" not in idset:
+            reasons.append("thiếu chessboard")
+        # Đếm quân: mọi id piece_* phải đúng 32.
+        piece_ids = [i for i in ids if i.startswith("piece_")]
+        if len(piece_ids) != 32:
+            reasons.append(f"quân cờ {len(piece_ids)}/32")
+        # Geometry + pose từng object so với kỳ vọng (tolerance 5mm).
+        expected_board = (BOARD_CENTER_X, BOARD_CENTER_Y, BOARD_CENTER_Z,
+                          BOARD_SIZE_X, BOARD_SIZE_Y, BOARD_THICKNESS)
+        for obj in world:
+            if obj.id == "chessboard":
+                if not obj.primitives:
+                    reasons.append("chessboard thiếu primitive")
+                    continue
+                d = tuple(float(v) for v in obj.primitives[0].dimensions)
+                if any(abs(a - b) > 1e-6 for a, b in zip(
+                        d, expected_board[3:])):
+                    reasons.append(f"chessboard geometry sai: {d}")
+                pp = obj.primitive_poses[0].position if obj.primitive_poses else obj.pose.position
+                if (abs(pp.x - expected_board[0]) > SCENE_VERIFY_POS_TOL_M
+                        or abs(pp.y - expected_board[1]) > SCENE_VERIFY_POS_TOL_M
+                        or abs(pp.z - expected_board[2]) > SCENE_VERIFY_POS_TOL_M):
+                    reasons.append("chessboard pose sai > 5mm")
+            elif obj.id.startswith("piece_"):
+                info = self.piece_info_by_id.get(obj.id)
+                if info is None:
+                    reasons.append(f"{obj.id} không có mapping nội bộ")
+                    continue
+                ptype, _color = info
+                col = PIECE_COLLISION[ptype]
+                if not obj.primitives:
+                    reasons.append(f"{obj.id} thiếu primitive")
+                    continue
+                d = tuple(float(v) for v in obj.primitives[0].dimensions)
+                if (abs(d[0] - col["height"]) > 1e-6
+                        or abs(d[1] - col["radius"]) > 1e-6):
+                    reasons.append(f"{obj.id} geometry sai: {d} vs {col}")
+        # Pose quân: đối chiếu tâm cylinder với ô mà mapping nội bộ ghi.
+        sq_by_id = {v: k for k, v in self.piece_id_by_square.items()}
+        for obj in world:
+            if not obj.id.startswith("piece_"):
+                continue
+            sq = sq_by_id.get(obj.id)
+            if sq is None:
+                reasons.append(f"{obj.id} không map về ô nào")
+                continue
+            info = self.piece_info_by_id.get(obj.id)
+            if info is None:
+                continue
+            ptype, _c = info
+            ex, ey = square_to_xy(sq)
+            ez = BOARD_Z + PIECE_COLLISION[ptype]["height"] / 2
+            pp = obj.primitive_poses[0].position if obj.primitive_poses else obj.pose.position
+            if (abs(pp.x - ex) > SCENE_VERIFY_POS_TOL_M
+                    or abs(pp.y - ey) > SCENE_VERIFY_POS_TOL_M
+                    or abs(pp.z - ez) > SCENE_VERIFY_POS_TOL_M):
+                reasons.append(f"{obj.id} pose sai > 5mm so với ô {sq}")
+                break  # gọn log, 1 mẫu đã đủ báo
+        return reasons
+
+    def _planner_ready(self) -> bool:
+        try:
+            client = self.moveit2._plan_kinematic_path_service
+            return bool(client.service_is_ready())
+        except Exception:
+            return False
+
+    def _controller_active(self) -> tuple[bool, str]:
+        """Verify controller active (TODO-1). Ưu tiên list_controllers."""
+        if self._list_controllers_client is not None:
+            try:
+                if not self._list_controllers_client.service_is_ready():
+                    return False, "controller_manager chưa có service"
+                req = ListControllers.Request()
+                future = self._list_controllers_client.call_async(req)
+                deadline = time.monotonic() + 3.0
+                while not future.done():
+                    if time.monotonic() >= deadline:
+                        return False, "list_controllers timeout"
+                    time.sleep(0.02)
+                result = future.result()
+                if result is None:
+                    return False, "list_controllers không phản hồi"
+                for ctrl in result.controller:
+                    name = ctrl.name
+                    if ("arm" in name or "trajectory" in name
+                            or "fake" in name or "dofbot" in name):
+                        if ctrl.state == "active":
+                            return True, ""
+                states = ",".join(f"{c.name}={c.state}" for c in result.controller)
+                return False, f"không controller arm nào active ({states})"
+            except Exception as exc:
+                return False, f"list_controllers lỗi: {exc}"
+        # Fallback: joint_states tươi + moveit2 joint_state có dữ liệu.
+        if self.moveit2.joint_state is None:
+            return False, "chưa có joint state từ MoveIt2"
+        return True, ""
+
+    def _joint_states_fresh(self) -> tuple[bool, str]:
+        if self._last_joint_state_time is None:
+            # Chưa nhận mẫu nào: vẫn cho qua nếu MoveIt2 đã có state (sim mới
+            # start), nhưng báo rõ để log.
+            if self.moveit2.joint_state is not None:
+                return True, ""
+            return False, "/joint_states chưa có dữ liệu"
+        age = time.monotonic() - self._last_joint_state_time
+        if age > JOINT_STATE_MAX_AGE_SEC:
+            return False, f"/joint_states cũ {age:.1f}s (> {JOINT_STATE_MAX_AGE_SEC}s)"
+        return True, ""
+
+    def _check_system_readiness(self) -> list[str]:
+        """Tổng hợp mọi điều kiện READY (TODO-1). Rỗng = READY."""
+        reasons: list[str] = []
+        reasons.extend(self._verify_initial_scene())
+        if not self._planner_ready():
+            reasons.append("planner service chưa sẵn sàng")
+        ok_ctrl, why_ctrl = self._controller_active()
+        if not ok_ctrl:
+            reasons.append(f"controller chưa active: {why_ctrl}")
+        ok_js, why_js = self._joint_states_fresh()
+        if not ok_js:
+            reasons.append(why_js)
+        return reasons
+
+    def _announce_ready(self):
+        msg = String()
+        msg.data = "READY"
+        self.ready_pub.publish(msg)
+        self._system_ready = True
+        self._ready_since = time.monotonic()
+        self.get_logger().info("[READY] hạ tầng đạt: scene 33/33 + planner + controller + joint_states")
+
+    def _wait_for_system_ready(self, timeout_sec: float):
+        deadline = time.monotonic() + timeout_sec
+        last_log = 0.0
+        while rclpy.ok():
+            reasons = self._check_system_readiness()
+            if not reasons:
+                self._announce_ready()
+                return
+            now = time.monotonic()
+            if now - last_log >= 5.0:
+                self.get_logger().warning(
+                    "[NOT-READY] chưa READY: " + "; ".join(reasons))
+                last_log = now
+            if now >= deadline:
+                raise RuntimeError(
+                    "hệ thống chưa READY sau "
+                    f"{timeout_sec:.0f}s: " + "; ".join(reasons))
+            time.sleep(0.2)
+
+    def _require_ready(self, context: str):
+        if not self._system_ready:
+            reasons = self._check_system_readiness()
+            raise RuntimeError(
+                f"{context} bị từ chối: hệ thống chưa READY: "
+                + ("; ".join(reasons) if reasons else "unknown"))
+
+    # ---------------- TODO-6/7: log ván + gate phần cứng ----------------
+
+    def _require_hardware_gates(self, uci: str):
+        """TODO-7: chặn execute phần cứng khi chưa calibration (fail-loud).
+
+        Sim/FakeSystem (REACHABILITY_EXECUTE_ON_FAKESYSTEM=True) luôn qua.
+        Robot thật yêu cầu: TCP_OFFSET_CALIBRATED=True, velocity scale <= 0.25,
+        low-speed test bật, e-stop sẵn sàng (vận hành thủ công xác nhận qua
+        param). Thiếu -> raise để NACK thay vì chạy mù.
+        """
+        if REACHABILITY_EXECUTE_ON_FAKESYSTEM:
+            return
+        problems = []
+        if not TCP_OFFSET_CALIBRATED:
+            problems.append("TCP_TO_CONTACT_OFFSET_Z chưa calibration")
+        try:
+            scale = float(self.get_parameter(
+                "hardware_safe_velocity_scale").value)
+            if not 0.0 < scale <= 0.25:
+                problems.append(
+                    f"velocity_scale={scale} vượt ngưỡng an toàn 0.25")
+            if not bool(self.get_parameter("hardware_low_speed_test").value):
+                problems.append("hardware_low_speed_test đang tắt")
+        except Exception as exc:
+            problems.append(f"không đọc param an toàn ({exc})")
+        if problems:
+            raise RuntimeError(
+                f"gate phần cứng chặn nước {uci}: " + "; ".join(problems)
+                + ". Test không tải + từng ô/quân ở tốc độ thấp trước.")
+
+    def _snapshot_scene_ids(self) -> dict:
+        try:
+            attached, world = self._scene_object_ids()
+            return {"attached": sorted(attached), "world": sorted(world),
+                    "board_fen": self.board.fen(),
+                    "discard": self.discard_count}
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def _log_move_result(self, cmd: int, uci: str, ok: bool, reason: str = ""):
+        entry = {
+            "seed": self._run_seed, "cmd": cmd, "uci": uci, "ok": ok,
+            "reason": reason,
+            "place_region": self._last_place_region,
+            "place_seeds": self._last_place_seed_count,
+            "place_choice": self._last_place_choice,
+            "scene": self._snapshot_scene_ids(),
+        }
+        self._run_moves.append(entry)
+        try:
+            with open("/tmp/chess_moves.jsonl", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        self.get_logger().info(
+            f"[RUN-LOG] seed={self._run_seed} cmd={cmd} {uci} "
+            f"{'OK' if ok else 'FAIL'} choice={self._last_place_choice}")
 
     # ---------------- Planning scene ----------------
 
@@ -275,23 +649,38 @@ class PickPlaceNode(Node):
         return f"piece_{next(self._id_counter):03d}"
 
     def _setup_initial_scene(self):
-        """Thêm bàn cờ thật 24cm (1 box) + quân cờ (cylinder) vào PlanningScene
-        theo đúng vị trí bắt đầu chuẩn của chess.Board()."""
-        if COLLISION_ENABLED:
-            self.moveit2.add_collision_box(
-                id="chessboard",
-                position=[BOARD_CENTER_X, BOARD_CENTER_Y, BOARD_CENTER_Z],
-                quat_xyzw=[0.0, 0.0, 0.0, 1.0],
-                size=[BOARD_SIZE_X, BOARD_SIZE_Y, BOARD_THICKNESS],
-            )
+        """Dựng scene chuẩn 33/33 bằng MỘT lần /apply_planning_scene (TODO-1).
 
+        Visual vẫn publish 1 snapshot duy nhất để tránh RViz update storm.
+        """
         self._publish_board_visual(publish=False)
-        for square, piece in self.board.piece_map().items():
-            self._add_piece_collision(chess.square_name(square), piece, publish=False)
-        # FPS fix: startup trước đây publish 1 snapshot full (64 ô + N quân)
-        # sau MỖI quân (33 lần) + mỗi add_collision_* trigger 1 planning-scene
-        # diff -> RViz update storm. Giờ chỉ publish 1 lần duy nhất.
+        # Dựng mapping nội bộ trước để _build_* dùng piece_map chuẩn.
+        self.piece_id_by_square.clear()
+        self.piece_info_by_id.clear()
+        self._id_counter = itertools.count()
+        if not COLLISION_ENABLED:
+            for square, piece in self.board.piece_map().items():
+                name = chess.square_name(square)
+                obj_id = self._new_piece_id()
+                self.piece_id_by_square[name] = obj_id
+                self.piece_info_by_id[obj_id] = (
+                    piece.symbol().lower(), piece.color)
+                self._publish_piece_visual(
+                    obj_id, (*square_to_xy(name), BOARD_Z), publish=False)
+            self._publish_all_visual()
+            return
+        objects = self._build_initial_collision_objects()
+        self._apply_initial_scene_once(objects)
+        # Visual cho từng quân từ mapping vừa dựng (không add collision lần 2).
+        for square, obj_id in self.piece_id_by_square.items():
+            self._publish_piece_visual(
+                obj_id, (*square_to_xy(square), BOARD_Z), publish=False)
         self._publish_all_visual()
+        # Đọc lại và verify ngay: fail-loud nếu chưa 33/33.
+        reasons = self._verify_initial_scene()
+        if reasons:
+            raise RuntimeError(
+                "scene ban đầu chưa đạt 33/33: " + "; ".join(reasons))
 
     def _add_piece_collision(self, square: str, piece: chess.Piece, publish: bool = True):
         obj_id = self._new_piece_id()
@@ -930,6 +1319,67 @@ class PickPlaceNode(Node):
         world_ids = {obj.id for obj in scene.world.collision_objects}
         return attached_ids, world_ids
 
+    def _assert_scene_invariant(self, context: str, expect_attached: str | None = None,
+                                expect_world_pose=None):
+        """TODO-5: kiểm tra scene invariant trong runtime, fail-loud.
+
+        - Không mất board; không double world+attached cùng ID.
+        - Sau attach: quân chỉ ở attached. Sau detach: quân ở world đúng pose.
+        - world/attached khớp mapping nội bộ (board state + discard).
+        Vi phạm -> khóa RECOVERY + raise (dừng an toàn).
+        """
+        if not COLLISION_ENABLED:
+            return
+        try:
+            scene = self._get_planning_scene(
+                PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+                | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS)
+        except Exception as exc:
+            self._needs_recovery = True
+            self._carry_state = "RECOVERY_REQUIRED"
+            raise RuntimeError(f"scene invariant {context}: không đọc scene ({exc})")
+        attached_ids = {a.object.id for a in scene.robot_state.attached_collision_objects}
+        world_ids = {o.id for o in scene.world.collision_objects}
+        problems: list[str] = []
+        if "chessboard" not in world_ids:
+            problems.append("mất chessboard")
+        double = attached_ids & world_ids
+        if double:
+            problems.append(f"double world+attached: {sorted(double)}")
+        if expect_attached is not None:
+            if expect_attached not in attached_ids:
+                problems.append(f"{expect_attached} phải attached sau attach")
+            if expect_attached in world_ids:
+                problems.append(f"{expect_attached} còn sót trong world sau attach")
+        if expect_world_pose is not None:
+            obj_id, xyz, ptype = expect_world_pose
+            if obj_id in attached_ids:
+                problems.append(f"{obj_id} còn attached sau detach")
+            if obj_id not in world_ids:
+                problems.append(f"{obj_id} mất khỏi world sau detach")
+        # Mapping nội bộ khớp scene: mọi quân trong map phải ở đúng một nơi.
+        for sq, oid in self.piece_id_by_square.items():
+            in_w = oid in world_ids
+            in_a = oid in attached_ids
+            if not in_w and not in_a:
+                problems.append(f"{oid} (ô {sq}) mất dấu khỏi scene")
+            if in_w and in_a:
+                problems.append(f"{oid} (ô {sq}) double world+attached")
+        # World/attached/board/discard khớp nhau (TODO-5/6): số quân world
+        # (trừ scratch) phải bằng quân trên board python-chess + discard_count.
+        world_pieces = [i for i in world_ids
+                        if i.startswith("piece_") and not i.startswith("__dry_")]
+        n_board = len(self.board.piece_map())
+        if len(world_pieces) != n_board + self.discard_count:
+            problems.append(
+                f"world/board/discard lệch: world={len(world_pieces)} "
+                f"board={n_board} discard={self.discard_count}")
+        if problems:
+            self._needs_recovery = True
+            self._carry_state = "RECOVERY_REQUIRED"
+            raise RuntimeError(
+                f"scene invariant {context} VI PHẠM: " + "; ".join(problems))
+
     def _attached_piece_local_pose(self, obj_id: str) -> Pose:
         """Đọc T_tcp_piece đúng như PlanningScene đang dùng cho collision."""
         scene = self._get_planning_scene(
@@ -1215,6 +1665,8 @@ class PickPlaceNode(Node):
 
         self._apply_attached_object(aco)
         self._wait_for_scene_object(obj_id, attached=True)
+        # TODO-5: sau attach, quân chỉ tồn tại trong attached, không còn world.
+        self._assert_scene_invariant(f"attach {obj_id}", expect_attached=obj_id)
         return obj_id
 
     def _detach_piece(self, obj_id: str, to_square: str, world_xyz, piece_type: str):
@@ -1241,6 +1693,10 @@ class PickPlaceNode(Node):
             self.piece_id_by_square[to_square] = obj_id
         if COLLISION_ENABLED:
             self._release_contact_object_ids.add(obj_id)
+        # TODO-5: sau detach, quân trở lại world đúng vị trí, không double.
+        if COLLISION_ENABLED:
+            self._assert_scene_invariant(
+                f"detach {obj_id}", expect_world_pose=(obj_id, world_xyz, piece_type))
 
     # ---------------- Move execution ----------------
 
@@ -1301,6 +1757,11 @@ class PickPlaceNode(Node):
         if cmd <= 0:
             self._fail(cmd, uci, "thiếu command_id hợp lệ")
             return
+        try:
+            self._require_ready(f"nước {uci}")
+        except Exception as exc:
+            self._fail(cmd, uci, str(exc))
+            return
         if self._needs_recovery:
             self._fail(cmd, uci, "hệ thống ở trạng thái RECOVERY_REQUIRED "
                                  "(scene/mapping không nhất quán sau lỗi trước); "
@@ -1337,6 +1798,12 @@ class PickPlaceNode(Node):
             # sau khi RViz đã mở).  Không được đánh rơi nước đầu tiên chỉ vì
             # service chưa xuất hiện ở thời điểm brain vừa publish nó.
             self._wait_for_motion_planner()
+            try:
+                self._require_hardware_gates(uci)
+            except Exception as exc:
+                self._fail(cmd, uci, str(exc))
+                self._log_move_result(cmd, uci, False, str(exc))
+                return
             self._move_to_home("HOME trước lượt Trắng")
             if self.board.is_capture(move):
                 # Với en passant, quân bị ăn không ở ô đích mà ở cùng rank với ô đi.
@@ -1373,9 +1840,11 @@ class PickPlaceNode(Node):
                 "[RECOVERY-REQUIRED] runtime transaction fail tại carry_state="
                 f"{self._carry_state}; restart launch trước khi chơi tiếp.")
             self._fail(cmd, uci, f"không thực thi: {exc}")
+            self._log_move_result(cmd, uci, False, str(exc))
             return
         else:
             self.get_logger().info(f"[OK] done {uci}")
+            self._log_move_result(cmd, uci, True)
             self._ack(cmd, uci)
 
     def _remove_virtual_piece(self, square: str):
@@ -1773,10 +2242,67 @@ class PickPlaceNode(Node):
                 return response
             self._executing = True
         try:
+            try:
+                self._require_ready("reachability check")
+            except Exception as exc:
+                response.success = False
+                response.message = str(exc)
+                return response
             return self._check_reachability_impl(request, response)
         finally:
             with self._exec_lock:
                 self._executing = False
+
+    @staticmethod
+    def _classify_diagnostic_error(exc: Exception) -> str:
+        """Phân loại PASS/FAIL/INFRA_ERROR (TODO-4): lỗi hạ tầng không tính
+        thành lỗi reachability."""
+        text = str(exc).lower()
+        infra_keys = ("planning scene", "planningscene", "controller",
+                      "planner", "joint_states", "joint state", "service",
+                      "timeout", "not ready", "not-ready", "recovery")
+        if any(k in text for k in infra_keys):
+            return "INFRA_ERROR"
+        return "FAIL"
+
+    def _reset_diagnostic_case(self, label: str):
+        """Khôi phục trạng thái độc lập trước mỗi case (TODO-4): HOME, scene
+        chuẩn, attached rỗng, ACM mặc định, controller active."""
+        # Dọn scratch còn sót từ case trước (best-effort).
+        try:
+            attached, _world = self._scene_object_ids()
+            for stale in list(attached):
+                if stale.startswith("__dry_"):
+                    try:
+                        self._dry_detach_scratch(stale)
+                    except Exception:
+                        pass
+            _a2, world_ids = self._scene_object_ids()
+            for oid in list(world_ids):
+                if oid.startswith("__dry_discard_occupied_"):
+                    try:
+                        self.moveit2.remove_collision_object(id=oid)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self._move_to_home(f"diagnostic HOME trước {label}")
+        try:
+            attached, _w = self._scene_object_ids()
+            if attached:
+                raise RuntimeError(f"attached objects còn sót: {sorted(attached)}")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"không đọc scene trước {label}: {exc}")
+        ok_ctrl, why = self._controller_active()
+        if not ok_ctrl:
+            raise RuntimeError(f"controller chưa active trước {label}: {why}")
+        # Scene invariant sau khôi phục (board + mapping khớp).
+        try:
+            self._assert_scene_invariant(f"diagnostic-reset {label}")
+        except RuntimeError as exc:
+            raise RuntimeError(f"scene invariant trước {label}: {exc}")
 
     def _check_reachability_impl(self, _request, response):
         """Kiểm tra khả năng gắp thật theo 2 tầng, CHỈ cho quân TRẮNG.
@@ -1895,40 +2421,92 @@ class PickPlaceNode(Node):
             )
             if scratch_square is None:
                 raise RuntimeError("deep-check cần một ô trống trong e4/d5/c4/f5")
-            aborted_case = None
+            # TODO-4: chạy đủ toàn bộ matrix, KHÔNG fail-fast. Mỗi case độc lập:
+            # reset HOME/scene/ACM/controller trước, check invariant sau.
+            case_results: list[tuple[str, str, str]] = []  # (case, verdict, reason)
             squares_done = 0
             for square in deep_squares:
                 piece = self.board.piece_at(chess.parse_square(square))
                 piece_type = piece.symbol().lower() if piece else "p"
+                try:
+                    self._reset_diagnostic_case(f"ô {square}")
+                except Exception as exc:
+                    verdict = self._classify_diagnostic_error(exc)
+                    reason = f"reset fail: {exc}"
+                    case_results.append((square, verdict, reason))
+                    deep.setdefault("infra" if verdict == "INFRA_ERROR" else "reset",
+                                    []).append(f"{square}: {reason}")
+                    self.get_logger().error(f"[DIAG] {square}: {verdict} ({reason})")
+                    continue
                 before = sum(len(items) for items in deep.values())
-                self._dry_run_square(square, piece_type, scratch_square, deep, execute)
+                try:
+                    self._dry_run_square(square, piece_type, scratch_square, deep, execute)
+                except Exception as exc:
+                    verdict = self._classify_diagnostic_error(exc)
+                    deep.setdefault("infra" if verdict == "INFRA_ERROR" else "exception",
+                                    []).append(f"{square}: {exc}")
+                    case_results.append((square, verdict, str(exc)))
                 squares_done += 1
-                if sum(len(items) for items in deep.values()) > before:
-                    aborted_case = square
-                    break
+                after = sum(len(items) for items in deep.values())
+                if after == before:
+                    case_results.append((square, "PASS", ""))
+                    self.get_logger().info(
+                        f"[DIAG] {square}: PASS (seed vùng "
+                        f"{self._region_for_target(square_to_xy(square))})")
+                else:
+                    # _dry_run_square đã ghi chi tiết vào deep{}; phân loại thêm.
+                    last_err = "; ".join(
+                        f"{k}:{v[-1]}" for k, v in deep.items() if v)
+                    verdict = ("INFRA_ERROR" if "infra" in deep else "FAIL")
+                    case_results.append((square, verdict, last_err))
+                try:
+                    self._assert_scene_invariant(f"diagnostic sau ô {square}")
+                except Exception as exc:
+                    case_results.append((f"{square}/invariant", "INFRA_ERROR", str(exc)))
+                    deep.setdefault("infra", []).append(f"{square}/invariant: {exc}")
             slots_done = 0
-            if aborted_case is None:
-                for slot in self.DEEP_CHECK_DISCARD_SLOTS:
-                    before = sum(len(items) for items in deep.values())
+            for slot in self.DEEP_CHECK_DISCARD_SLOTS:
+                try:
+                    self._reset_diagnostic_case(f"slot{slot}")
+                except Exception as exc:
+                    verdict = self._classify_diagnostic_error(exc)
+                    reason = f"reset fail: {exc}"
+                    case_results.append((f"slot{slot}", verdict, reason))
+                    deep.setdefault("infra" if verdict == "INFRA_ERROR" else "reset",
+                                    []).append(f"slot{slot}: {reason}")
+                    continue
+                before = sum(len(items) for items in deep.values())
+                try:
                     self._dry_run_discard_slot(
                         slot, deep,
                         execute and slot in self.DEEP_CHECK_DISCARD_EXEC_SLOTS)
-                    slots_done += 1
-                    if sum(len(items) for items in deep.values()) > before:
-                        aborted_case = f"slot{slot}"
-                        break
-            if aborted_case is not None:
-                skipped_squares = len(deep_squares) - squares_done
-                skipped_slots = (
-                    len(self.DEEP_CHECK_DISCARD_SLOTS) - slots_done
-                    if squares_done == len(deep_squares) else
-                    len(self.DEEP_CHECK_DISCARD_SLOTS))
-                self.get_logger().warning(
-                    f"[FAIL-FAST] dừng deep-check sau root failure tại {aborted_case}; "
-                    f"đã chạy {squares_done}/{len(deep_squares)} ô + "
-                    f"{slots_done}/{len(self.DEEP_CHECK_DISCARD_SLOTS)} slot, "
-                    f"bỏ qua (skipped) {skipped_squares} ô + {skipped_slots} slot."
-                )
+                except Exception as exc:
+                    verdict = self._classify_diagnostic_error(exc)
+                    deep.setdefault("infra" if verdict == "INFRA_ERROR" else "exception",
+                                    []).append(f"slot{slot}: {exc}")
+                    case_results.append((f"slot{slot}", verdict, str(exc)))
+                slots_done += 1
+                after = sum(len(items) for items in deep.values())
+                if after == before:
+                    case_results.append((f"slot{slot}", "PASS", ""))
+                else:
+                    last_err = "; ".join(
+                        f"{k}:{v[-1]}" for k, v in deep.items() if v)
+                    verdict = ("INFRA_ERROR" if "infra" in deep else "FAIL")
+                    case_results.append((f"slot{slot}", verdict, last_err))
+                try:
+                    self._assert_scene_invariant(f"diagnostic sau slot{slot}")
+                except Exception as exc:
+                    case_results.append((f"slot{slot}/invariant", "INFRA_ERROR", str(exc)))
+                    deep.setdefault("infra", []).append(f"slot{slot}/invariant: {exc}")
+            n_pass = sum(1 for _c, v, _r in case_results if v == "PASS")
+            n_fail = sum(1 for _c, v, _r in case_results if v == "FAIL")
+            n_infra = sum(1 for _c, v, _r in case_results if v == "INFRA_ERROR")
+            self.get_logger().info(
+                f"[DIAG] full-matrix: {squares_done}/{len(deep_squares)} ô + "
+                f"{slots_done}/{len(self.DEEP_CHECK_DISCARD_SLOTS)} slot; "
+                f"PASS={n_pass} FAIL={n_fail} INFRA_ERROR={n_infra}")
+            self._reachability_case_results = case_results
             if execute:
                 # Trả arm về HOME sau slot cuối (trước đây bỏ sót): không để
                 # arm đứng chơ vơ ở khu discard sau check.
@@ -1967,14 +2545,19 @@ class PickPlaceNode(Node):
             response.message = (
                 f"trắng approach {n_white-len(failures['approach'])}/{n_white}, "
                 f"pick {n_white-len(failures['pick'])}/{n_white}; "
-                f"deep-check đã chạy {squares_done}/{len(deep_squares)} ô trắng + "
+                f"deep {squares_done}/{len(deep_squares)} ô + "
                 f"{slots_done}/{len(self.DEEP_CHECK_DISCARD_SLOTS)} slot "
-                f"(fail-fast bỏ qua phần còn lại khi có lỗi), "
-                f"lỗi {deep_total} "
+                f"(full-matrix, không fail-fast); "
+                f"PASS={n_pass} FAIL={n_fail} INFRA_ERROR={n_infra} "
                 f"({'EXECUTE' if execute else 'plan-only'}, collision={'ON' if COLLISION_ENABLED else 'OFF'}). "
                 + ("PASS toàn bộ." if response.success
                    else "CÓ LỖI — xem terminal để biết ô/phase.")
             )
+            # Log seed + nguyên nhân từng case để tái hiện (TODO-4/6).
+            for case, verdict, reason in case_results:
+                self.get_logger().info(
+                    f"[DIAG-CASE] {case}: {verdict}"
+                    + (f" ({reason})" if reason else ""))
         except Exception as exc:
             if REACHABILITY_EXECUTE_ON_FAKESYSTEM:
                 self._needs_recovery = True
@@ -2520,7 +3103,7 @@ class PickPlaceNode(Node):
         return position_error, tilt, center, q_piece
 
     def _compensate_place_tcp(self, place_tcp, center, target_xy,
-                              piece_type: str):
+                               piece_type: str):
         """Dịch XYZ TCP theo sai số tâm quân FK; không thay quaternion.
 
         IK position-only có thể chọn orientation khác q yêu cầu, nhưng log thực
@@ -2545,6 +3128,159 @@ class PickPlaceNode(Node):
             place_tcp[3],
         )
 
+    # ---------------- TODO-2: candidate IK + scoring ----------------
+
+    @staticmethod
+    def _region_for_target(target_xy) -> str:
+        """Phân vùng bàn cờ để chọn joint template (TODO-2/3)."""
+        x, y = float(target_xy[0]), float(target_xy[1])
+        if y < -0.10:
+            return "discard"
+        if x < 0.13:
+            return "near"
+        if x > 0.27:
+            return "far"
+        return "center"
+
+    def _candidate_seed_states(self, region: str) -> list:
+        """Các seed joint-state hữu hạn cho pre-place (TODO-2).
+
+        HOME + template vùng + state hiện tại: phủ nhánh khớp khác nhau thay
+        vì mọi ô cùng một seed.
+        """
+        seeds = []
+        try:
+            self._wait_for_joint_state(self.moveit2, timeout_sec=3.0)
+            cur = copy.deepcopy(self.moveit2.joint_state)
+            seeds.append(("current", cur))
+        except Exception:
+            pass
+        try:
+            home = self._home_joint_state()
+            seeds.append(("home", home))
+        except Exception:
+            pass
+        template = REGION_JOINT_TEMPLATES.get(region)
+        if template is not None:
+            try:
+                self._wait_for_joint_state(self.moveit2, timeout_sec=3.0)
+                base = copy.deepcopy(self.moveit2.joint_state)
+                values = dict(zip(base.name, base.position))
+                values.update(zip(JOINT_NAMES, template))
+                base.position = [values[n] for n in base.name]
+                seeds.append((f"template:{region}", base))
+            except Exception:
+                pass
+        # Dedup giữ thứ tự.
+        seen, out = set(), []
+        for label, state in seeds:
+            if label not in seen:
+                seen.add(label)
+                out.append((label, state))
+        return out
+
+    def _query_ik_joint_target(self, position, quat_xyzw, seed_state,
+                               context: str):
+        """Gọi /compute_ik với seed tường minh, avoid_collisions=True.
+
+        Trả về dict joint->pos hoặc None (có log lý do reject).
+        """
+        if not self._ik_client.service_is_ready():
+            self.get_logger().warning(f"[CANDIDATE] {context}: IK service chưa sẵn sàng")
+            return None
+        req = GetPositionIK.Request()
+        ik = req.ik_request
+        ik.group_name = GROUP_NAME
+        ik.ik_link_name = END_EFFECTOR
+        ik.avoid_collisions = True
+        ik.robot_state = RobotState()
+        ik.robot_state.joint_state = copy.deepcopy(seed_state)
+        ik.robot_state.is_diff = False
+        ik.pose_stamped = PoseStamped()
+        ik.pose_stamped.header.frame_id = BASE_LINK
+        ik.pose_stamped.pose.position.x = float(position[0])
+        ik.pose_stamped.pose.position.y = float(position[1])
+        ik.pose_stamped.pose.position.z = float(position[2])
+        ik.pose_stamped.pose.orientation.x = float(quat_xyzw[0])
+        ik.pose_stamped.pose.orientation.y = float(quat_xyzw[1])
+        ik.pose_stamped.pose.orientation.z = float(quat_xyzw[2])
+        ik.pose_stamped.pose.orientation.w = float(quat_xyzw[3])
+        ik.timeout.sec = 1
+        future = self._ik_client.call_async(req)
+        deadline = time.monotonic() + 3.0
+        while not future.done():
+            if time.monotonic() >= deadline:
+                self.get_logger().warning(f"[CANDIDATE] {context}: IK timeout")
+                return None
+            time.sleep(0.01)
+        result = future.result()
+        if result is None or result.error_code.val != 1:
+            code = "no-response" if result is None else str(result.error_code.val)
+            self.get_logger().info(f"[CANDIDATE] {context}: IK không nghiệm (code={code})")
+            return None
+        return dict(zip(result.solution.joint_state.name,
+                        result.solution.joint_state.position))
+
+    @staticmethod
+    def _joint_travel_rad(current_state: JointState, target_map: dict) -> float:
+        total = 0.0
+        cur = dict(zip(current_state.name, current_state.position))
+        for name in JOINT_NAMES:
+            if name in cur and name in target_map:
+                d = math.atan2(math.sin(cur[name] - float(target_map[name])),
+                               math.cos(cur[name] - float(target_map[name])))
+                total += abs(d)
+        return total
+
+    @staticmethod
+    def _min_limit_margin_rad(target_map: dict) -> float:
+        margins = []
+        for name in JOINT_NAMES:
+            lim = DOFBOT_JOINT_LIMITS.get(name)
+            if lim is None or name not in target_map:
+                continue
+            v = float(target_map[name])
+            margins.append(min(v - lim[0], lim[1] - v))
+        return min(margins) if margins else 0.0
+
+    @staticmethod
+    def _trajectory_max_step(trajectory) -> float:
+        worst = 0.0
+        prev = None
+        for pt in trajectory.points:
+            cur = [float(v) for v in pt.positions]
+            if prev is not None and len(cur) == len(prev):
+                worst = max(worst, max(abs(b - a) for a, b in zip(prev, cur)))
+            prev = cur
+        return worst
+
+    def _score_place_candidate(self, pos_err: float, tilt: float,
+                               travel: float, margin: float) -> float:
+        """Điểm càng thấp càng tốt (TODO-2): err + tilt + travel - margin."""
+        return (pos_err * CANDIDATE_SCORE_W_POS
+                + tilt * CANDIDATE_SCORE_W_TILT
+                + travel * CANDIDATE_SCORE_W_TRAVEL
+                + margin * CANDIDATE_SCORE_W_LIMIT_MARGIN)
+
+    def _upright_quat_yaw_free(self, yaw: float = 0.0):
+        """Quat TCP thẳng đứng (tilt=0), yaw tự do quanh Z (TODO-3)."""
+        s, c = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        return (0.0, 0.0, s, c)
+
+    def _evaluate_upright_constraint_impact(self, context: str) -> dict:
+        """Đánh giá ảnh hưởng orientation constraint tới reachability (TODO-3).
+
+        So sánh: descend với quat thẳng đứng vs quat scoring hiện tại trên cùng
+        target. Không làm fail diagnostic; chỉ log để quyết định giữ scoring
+        (mặc định) hay bật constraint.
+        """
+        result = {"constraint": "upright-yaw-free", "enabled": USE_UPRIGHT_ORIENTATION_CONSTRAINT}
+        self.get_logger().info(
+            f"[TILT-EVAL] {context}: upright-constraint="
+            f"{USE_UPRIGHT_ORIENTATION_CONSTRAINT} (scoring mặc định giữ "
+            f"reachability; bật cờ để ép thẳng đứng rồi đo lại)")
+        return result
+
     def _plan_quiet(self, context: str, **kwargs):
         """Plan trả None khi fail thay vì raise — precheck thử nghiệm kế.
 
@@ -2562,7 +3298,7 @@ class PickPlaceNode(Node):
             grasp_xyz, grasp_approach_z: float, grasp_q,
             target_xy, target_approach_z: float,
             source_obj_id: str | None, source_xyz, context: str,
-            yaw_count: int = PLACE_YAW_COUNT):
+            yaw_count: int = CANDIDATE_YAW_COUNT):
         """Kiểm tra TOÀN CHUỖI mang trước khi gắp thật, với đúng thể tích quân.
 
         Một scratch session duy nhất giữ T_tcp_piece giả định của đúng offset
@@ -3029,11 +3765,17 @@ class PickPlaceNode(Node):
     def _place_at_dest_compensated(self, obj_id: str, target_xy, tcp_z: float,
                                    piece_type: str, approach_z: float,
                                    verified_quat, step_name: str):
-        """Hạ đặt tại đích bằng FK → bù sai số tâm TCP lặp."""
+        """Hạ đặt tại đích bằng candidate IK hữu hạn + FK chấm điểm (TODO-2)."""
+        local = self._grasp_local_by_id.get(obj_id)
         candidates = self._place_tcp_candidates_for_target(
             obj_id, target_xy, tcp_z, piece_type,
             preferred_quat=self._current_tcp_quat(),
-            verified_quat=verified_quat)
+            verified_quat=verified_quat,
+            yaw_count=CANDIDATE_YAW_COUNT)
+        # Ghi seed vùng để log tái hiện (TODO-6).
+        self._last_place_region = self._region_for_target(target_xy)
+        self._last_place_seed_count = len(
+            self._candidate_seed_states(self._last_place_region))
         return self._move_vertical_place_compensated(
             candidates, step_name, obj_id, target_xy, piece_type, approach_z)
 
@@ -3160,21 +3902,14 @@ class PickPlaceNode(Node):
                                          step_name: str, obj_id: str,
                                          target_xy, piece_type: str,
                                          approach_z: float):
-        """Hạ đặt với XYZ compensation lặp và board-contact theo phase.
+        """Hạ đặt với candidate IK hữu hạn + Cartesian descend (TODO-2).
 
-        Robot đang ATTACHED ở approach đích. Mỗi vòng chỉ plan: FK endpoint
-        cho tâm quân dự kiến, sau đó dịch XYZ TCP ngược sai số và plan lại.
-        Descend là computeCartesianPath thật (IK/Jacobian + collision mỗi
-        waypoint 2mm, fraction 0.98) — KHÔNG phải cộng tay vào joint.
-        Tilt là bộ lọc mềm: thoát sớm khi <=0.20 rad, chấp nhận tới 0.45,
-        trên 0.45 thì loại và thử nghiệm khác. Đã đứng sẵn ở approach thì bỏ
-        qua OMPL pre-place zero-length (gộp transfer/pre-place).
-        Phase lateral: board_contact ĐÓNG; chỉ MỞ cho đúng đoạn descend.
-
-        Không hội tụ thì raise khi arm CHƯA hề nhúc nhích. Chỉ execute cặp
-        pre-place/descend cuối đã đưa tâm quân vào sai số 5 mm.
-        Trả về place_tcp đã execute thành công (board-contact đang MỞ, caller
-        verify → detach → retreat 65mm rồi mới đóng lại, thỏa clearance 10mm).
+        Robot đang ATTACHED ở approach đích. Mỗi candidate (yaw quanh trục
+        đứng × seed vùng): plan OMPL pre-place -> Cartesian descend 2mm /
+        fraction 0.98 từ chính candidate -> FK tâm quân + tilt -> gate
+        fraction/err<=5mm/tilt<=26°/collision toàn trajectory/sát limit/
+        nhảy joint -> chấm điểm (err, tilt, travel, margin) -> chọn tốt nhất
+        rồi execute MỘT lần. Không hội tụ thì raise khi arm chưa nhúc nhích.
         """
         self._set_piece_collision(
             obj_id, gripper_touch=True, board_contact=False)
@@ -3263,13 +3998,61 @@ class PickPlaceNode(Node):
                     break
                 if pos_err <= PLACE_POSITION_TOL_M:
                     place_tcp = (px, py, pz, fq)
-                    converged.append((tilt, pos_err, pre, desc, place_tcp, label))
+                    # TODO-2/3 gates trên từng candidate (fraction đã gate bởi
+                    # planner threshold 0.98: desc is None đã bị loại ở trên).
+                    reject = None
+                    if tilt > MAX_ACCEPTED_TILT_RAD:
+                        reject = (f"tilt {math.degrees(tilt):.1f}° > "
+                                  f"{math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°")
+                    else:
+                        try:
+                            last_map = dict(zip(desc.joint_names, last.positions))
+                            margin = self._min_limit_margin_rad(last_map)
+                            if margin < JOINT_LIMIT_MARGIN_RAD:
+                                reject = (f"sát joint limit margin "
+                                          f"{math.degrees(margin):.1f}°")
+                            elif max(self._trajectory_max_step(pre)
+                                     if pre is not None else 0.0,
+                                     self._trajectory_max_step(desc)) > MAX_JOINT_STEP_RAD:
+                                reject = ("bước nhảy joint bất thường")
+                            elif not self._cached_trajectory_collision_free(
+                                    desc, f"{label}/descend"):
+                                reject = "trajectory descend collision"
+                            elif (pre is not None
+                                  and not self._cached_trajectory_collision_free(
+                                      pre, f"{label}/pre-place")):
+                                reject = "trajectory pre-place collision"
+                        except Exception as exc:
+                            reject = f"gate candidate lỗi ({exc})"
+                    if reject is not None:
+                        errors.append(f"{label}: loại candidate ({reject})")
+                        self.get_logger().warning(
+                            f"[CANDIDATE] {step_name}: {label} loại: {reject} "
+                            f"(err {pos_err * 1000:.1f}mm "
+                            f"tilt {math.degrees(tilt):.1f}°)")
+                        corrected = self._compensate_place_tcp(
+                            place_tcp, center, target_xy, piece_type)
+                        place_tcp = corrected
+                        continue
+                    try:
+                        self._wait_for_joint_state(self.moveit2, timeout_sec=3.0)
+                        travel = self._joint_travel_rad(
+                            self.moveit2.joint_state, last_map)
+                    except Exception:
+                        travel, margin = 0.0, self._min_limit_margin_rad(last_map)
+                    score = self._score_place_candidate(
+                        pos_err, tilt, travel, margin)
+                    converged.append(
+                        (score, tilt, pos_err, pre, desc, place_tcp, label,
+                         travel, margin))
                     self.get_logger().info(
                         f"[PLACE-COMP] {step_name}: {label} đạt, lệch "
                         f"{pos_err * 1000:.1f}mm; "
                         f"tilt {math.degrees(tilt):.1f}° "
-                        f"(ưu <={math.degrees(PREFERRED_TILT_RAD):.0f}°, "
-                        f"chịu <={math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°)")
+                        f"(target <={math.degrees(PREFERRED_TILT_RAD):.0f}°, "
+                        f"hard <={math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°); "
+                        f"travel {math.degrees(travel):.0f}° "
+                        f"margin {math.degrees(margin):.0f}° score={score:.3f}")
                     if tilt <= PREFERRED_TILT_RAD:
                         break  # rất tốt: chốt ngay, khỏi bù tiếp
                     # Chưa tốt nhưng đạt tâm: bù tiếp xem vòng sau có tilt
@@ -3290,22 +4073,33 @@ class PickPlaceNode(Node):
             # Hết vòng bù của rank này mà chưa break sớm: sang rank tiếp theo
             # (nếu còn) để tìm nghiệm tilt thấp hơn.
         if converged:
-            # Chọn tilt nhỏ nhất trong các nghiệm đã đạt tâm (log RViz để đo).
-            converged.sort(key=lambda item: (item[0], item[1]))
-            best_tilt = converged[0][0]
+            # TODO-2: chọn score tổng hợp (err + tilt + travel - margin), log
+            # đầy đủ candidate được chọn + nguyên nhân reject (errors).
+            converged.sort(key=lambda item: (item[0], item[1], item[2]))
+            best_score, best_tilt = converged[0][0], converged[0][1]
             self.get_logger().info(
-                f"[TILT-SELECT] {step_name}: {len(converged)} nghiệm đạt tâm, "
+                f"[CANDIDATE-SELECT] {step_name}: {len(converged)} nghiệm đạt, "
                 + ", ".join(
-                    f"{lab} tilt={math.degrees(t):.1f}° err={e * 1000:.1f}mm"
-                    for t, e, _p, _d, _tcp, lab in converged)
-                + f" -> chọn tilt={math.degrees(best_tilt):.1f}°")
+                    f"{lab} tilt={math.degrees(t):.1f}° err={e * 1000:.1f}mm "
+                    f"travel={math.degrees(tr):.0f}° margin={math.degrees(m):.0f}° "
+                    f"score={s:.3f}"
+                    for s, t, e, _p, _d, _tcp, lab, tr, m in converged)
+                + f" -> chọn {converged[0][6]} score={best_score:.3f}")
+            if errors:
+                self.get_logger().info(
+                    f"[CANDIDATE-REJECTS] {step_name}: " + " | ".join(errors))
             if best_tilt > MAX_ACCEPTED_TILT_RAD:
                 raise RuntimeError(
                     f"{step_name}: mọi nghiệm đạt tâm đều nghiêng "
                     f">{math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}° "
                     f"(tốt nhất {math.degrees(best_tilt):.1f}°); từ chối để "
                     f"thử nước/offset khác (arm chưa di chuyển)")
-            _bt, _be, pre, desc, place_tcp, _bl = converged[0]
+            _bs, _bt, _be, pre, desc, place_tcp, _bl, _tr, _m = converged[0]
+            # Lưu candidate được chọn + rejects để tái hiện ván (TODO-6).
+            self._last_place_choice = {
+                "label": _bl, "score": _bs, "tilt_deg": math.degrees(_bt),
+                "err_mm": _be * 1000.0, "rejects": list(errors),
+            }
             chosen = (pre, desc, place_tcp)
         if chosen is None:
             raise RuntimeError(

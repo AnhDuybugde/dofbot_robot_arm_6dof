@@ -159,15 +159,97 @@ FINGER_THICKNESS = 0.006
 CARTESIAN_EEF_STEP = 0.002
 MIN_CARTESIAN_FRACTION = 0.98
 
+# ==== HẠ TẦNG / READY GATE (TODO-1) ====
+# PlanningScene chuẩn: 1 board + 32 quân = 33 world objects, attached rỗng.
+EXPECTED_WORLD_OBJECTS = 33
+EXPECTED_PIECE_OBJECTS = 32
+SYSTEM_READY_TOPIC = "/chess/system_ready"
+# /joint_states coi là stale nếu không có mẫu mới trong cửa sổ này.
+JOINT_STATE_MAX_AGE_SEC = 1.0
+# Thời gian tối đa chờ hạ tầng READY sau khi dựng scene (log rõ điều kiện fail).
+SYSTEM_READY_TIMEOUT_SEC = 60.0
+# Sai số cho phép khi verify pose scene đọc lại (tâm cylinder so với kỳ vọng).
+SCENE_VERIFY_POS_TOL_M = 0.005
+# Joint limits Dofbot 5-DOF (rad) để gate candidate quá sát limit (TODO-2).
+# Lấy từ mô tả URDF/SRDF; margin an toàn áp khi chấm candidate.
+DOFBOT_JOINT_LIMITS = {
+    "arm1_Joint": (-2.61799, 2.61799),
+    "arm2_Joint": (-1.57080, 1.57080),
+    "arm3_Joint": (-1.57080, 1.57080),
+    "arm4_Joint": (-1.57080, 1.57080),
+    "arm5_Joint": (-2.09440, 2.09440),
+}
+JOINT_LIMIT_MARGIN_RAD = 0.08
+# Bước nhảy joint bất thường trong một trajectory (rad giữa 2 waypoint kề).
+MAX_JOINT_STEP_RAD = 0.6
+# Scoring candidate (TODO-2): trọng số cho err (m), tilt (rad), travel (rad),
+# margin tới limit (rad, càng xa càng tốt nên trừ điểm).
+CANDIDATE_SCORE_W_POS = 1.0 / 0.005
+CANDIDATE_SCORE_W_TILT = 1.0 / 0.45
+CANDIDATE_SCORE_W_TRAVEL = 0.15
+CANDIDATE_SCORE_W_LIMIT_MARGIN = -0.5
+# Template joint theo vùng bàn cờ (TODO-2/3): seed IK ưu tiên theo vùng để
+# phủ nhánh khớp khác nhau thay vì mọi ô cùng một seed HOME.
+REGION_JOINT_TEMPLATES = {
+    # rank 1-2 gần đế: gập gọn tránh tự va.
+    "near": [0.0, -0.5, 1.0, -0.5, 0.0],
+    # trung tâm bàn: tư thế trung tính.
+    "center": [0.0, -0.3, 0.6, -0.3, 0.0],
+    # rank 7-8 xa đế: vươn dài.
+    "far": [0.0, -0.2, 0.4, -0.2, 0.0],
+    # khu discard (-Y): xoay đế sang bên.
+    "discard": [-0.5, -0.4, 0.8, -0.4, 0.0],
+}
+
+# ==== TILT 5-DOF (TODO-3) ====
+# Quality target <=11° (KPI, chưa blocker MVP), hard reject >26°.
+TILT_QUALITY_TARGET_RAD = 0.191986  # 11 deg
+TILT_HARD_LIMIT_RAD = 0.453786  # 26 deg
+# Thử orientation constraint giữ TCP gần thẳng đứng, yaw tự do (TODO-3).
+# False = dùng candidate scoring (mặc định, reachability cao hơn trên 5-DOF
+# position-only); True = ép descend theo quat thẳng đứng trước, rớt mới
+# fallback scoring và log ảnh hưởng reachability.
+USE_UPRIGHT_ORIENTATION_CONSTRAINT = False
+
+# ==== DIAGNOSTIC (TODO-4) ====
+DEEP_SQUARE_COUNT = 10
+DISCARD_SLOT_COUNT = 16
+
+# ==== CALIBRATION ROBOT THẬT (TODO-7, chưa đo -> fail-loud) ====
+# TCP_OFFSET_CALIBRATED (định nghĩa ở cụm bàn thật phía trên): False cho tới
+# khi đo OFFSET = measured_tcp_z - BOARD_TOP_Z - PIECE_GRASP_HEIGHT[type] trên
+# phần cứng. FakeSystem/sim chạy được với False; hardware execute bị chặn.
+# Tốc độ an toàn khi test phần cứng: scale 0..1, test không tải/tốc độ thấp.
+HARDWARE_SAFE_VELOCITY_SCALE = 0.25
+# Bảng gripper joint->inner width (m) khi đã đo FK/servo thật.
+# Format: [(joint_rad, inner_width_m), ...] sorted theo joint.
+# Trống = chưa calibration -> gripper_width_to_joint_angle raise.
+GRIPPER_CALIBRATION_TABLE: list = []
+
 
 def gripper_width_to_joint_angle(width_m: float) -> float:
-    """Map khoảng cách mặt trong finger -> joint angle. Chưa có bảng FK nên
-    raise để không ai nội suy tuyến tính sai. Tạo bảng joint->width bằng FK
-    RViz trước, hiệu chỉnh servo thật, rồi implement nội suy tại đây."""
-    raise NotImplementedError(
-        "Chưa có bảng calibration gripper_width_to_joint_angle; "
-        "giữ binary GRIPPER_OPEN/CLOSED_RAD."
-    )
+    """Map khoảng cách mặt trong finger -> joint angle (TODO-7).
+
+    Khi GRIPPER_CALIBRATION_TABLE đã đo (FK RViz + hiệu chỉnh servo thật, gồm
+    các mốc 20/14/12mm) thì nội suy tuyến tính từng đoạn. Bảng trống ->
+    raise để giữ binary GRIPPER_OPEN/CLOSED_RAD, cấm nội suy angle =
+    width/max*1.57 vì mimic phi tuyến.
+    """
+    table = sorted(GRIPPER_CALIBRATION_TABLE)
+    if not table:
+        raise NotImplementedError(
+            "Chưa có bảng calibration gripper_width_to_joint_angle; "
+            "giữ binary GRIPPER_OPEN/CLOSED_RAD. Đo joint->width bằng FK RViz, "
+            "hiệu chỉnh servo thật tại 20/14/12mm rồi điền "
+            "GRIPPER_CALIBRATION_TABLE."
+        )
+    if width_m <= table[0][1]:
+        return float(table[0][0])
+    for (j0, w0), (j1, w1) in zip(table, table[1:]):
+        if w0 <= width_m <= w1 or w1 <= width_m <= w0:
+            t = (width_m - w0) / (w1 - w0) if w1 != w0 else 0.0
+            return float(j0 + t * (j1 - j0))
+    return float(table[-1][0])
 
 # Candidate lệch tâm cho GẮP, tính bằng mét. Pipeline luôn thử tâm trước, rồi
 # mở rộng hữu hạn 3 -> 6 -> 8 mm; không tìm vô hạn và không mở collision với

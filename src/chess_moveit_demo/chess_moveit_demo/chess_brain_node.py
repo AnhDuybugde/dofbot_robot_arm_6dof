@@ -14,6 +14,7 @@ import chess
 import chess.engine
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
@@ -28,6 +29,19 @@ class ChessBrainNode(Node):
         self.engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
 
         self.move_pub = self.create_publisher(String, "/chess/move", 10)
+        # TODO-1: chờ tín hiệu READY từ pick_place (latch transient-local),
+        # thay cơ chế timer 12s cố định trong launch.
+        self.system_ready = False
+        self.ready_sub = self.create_subscription(
+            String,
+            "/chess/system_ready",
+            self.on_system_ready,
+            QoSProfile(
+                depth=1,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=ReliabilityPolicy.RELIABLE,
+            ),
+        )
         # pick_place_node báo lại khi robot đã thực thi xong nước đi, để brain đi tiếp
         self.ack_sub = self.create_subscription(
             String, "/chess/move_done", self.on_move_done, 10
@@ -61,6 +75,11 @@ class ChessBrainNode(Node):
             "Chess brain sẵn sàng. Bàn cờ đang chờ: ros2 service call /chess/start std_srvs/srv/Trigger '{}'"
         )
 
+    def on_system_ready(self, msg: String):
+        if msg.data.strip().upper() == "READY" and not self.system_ready:
+            self.system_ready = True
+            self.get_logger().info("[READY] hạ tầng pick-place sẵn sàng, brain được phép đi.")
+
     def start_game(self, request, response):
         if self.game_running:
             response.success = False
@@ -71,6 +90,12 @@ class ChessBrainNode(Node):
             response.message = (
                 "Game đang bị KHÓA sau lỗi chưa phục hồi (scene/executor có thể "
                 "sai). Restart launch rồi mới start ván mới.")
+            return response
+        if not self.system_ready:
+            response.success = False
+            response.message = (
+                "Hạ tầng chưa READY (scene/planner/controller/joint_states). "
+                "Chờ pick_place báo READY rồi start lại.")
             return response
         self.game_running = True
         # Timer one-shot: tuyệt đối không polling/phát lại nước cờ theo chu kỳ.
@@ -94,6 +119,13 @@ class ChessBrainNode(Node):
             self.timer = None
 
         if not self.game_running or self.waiting_for_ack:
+            return
+        if not self.system_ready:
+            self.get_logger().warning(
+                "[NOT-READY] brain chờ hạ tầng READY, chưa đi nước tiếp.",
+                throttle_duration_sec=5.0,
+            )
+            self._schedule_next_tick(1.0)
             return
         if self.board.is_game_over():
             self.get_logger().info(f"Ván kết thúc: {self.board.result()}")

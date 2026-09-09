@@ -1,7 +1,7 @@
 """Khởi động Dofbot MoveIt2 fake-control + RViz rồi chạy demo cờ."""
 
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, TimerAction
+from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
@@ -58,12 +58,7 @@ def generate_launch_description():
         output="screen",
     )
 
-    # move_group, IK plugin và fake controllers của Dofbot cần vài giây để sẵn
-    # sàng. Nếu brain publish ngay, nước đầu có thể bị mất vì các service planning
-    # chưa được advertise. Chỉ bắt đầu game sau khi toàn bộ MoveIt stack ổn định.
-    chess_after_moveit_ready = TimerAction(
-        period=12.0,
-        actions=[chess_brain, pick_place],
-    )
-
-    return LaunchDescription([moveit_launch, chess_rviz, chess_after_moveit_ready])
+    # TODO-1: bỏ timer cố định 12s. Brain/pick-place start ngay cùng MoveIt;
+    # pick_place tự gate READY (scene 33/33 + planner + controller +
+    # joint_states) rồi publish /chess/system_ready; brain chỉ đi khi READY.
+    return LaunchDescription([moveit_launch, chess_rviz, chess_brain, pick_place])
