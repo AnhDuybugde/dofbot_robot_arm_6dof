@@ -51,16 +51,35 @@ from pymoveit2 import MoveIt2
 from .chess_utils import (
     ALLOW_CARTESIAN_FALLBACK,
     APPROACH_HEIGHT,
+    BOARD_CENTER_X,
+    BOARD_CENTER_Y,
+    BOARD_CENTER_Z,
+    BOARD_SIZE_X,
+    BOARD_SIZE_Y,
+    BOARD_THICKNESS,
+    BOARD_TOP_Z,
     BOARD_Z,
+    CARTESIAN_EEF_STEP,
     DISCARD_MAX_SLOTS,
     DISCARD_TCP_Z,
+    FINGER_THICKNESS,
+    FINAL_GRASP_INNER_WIDTH,
     GRASP_APPROACH_CANDIDATE_OFFSETS,
     GRASP_MAX_OFFSET,
     GRASP_SEARCH_TIMEOUT_SEC,
+    GRIPPER_CLOSED_RAD,
+    GRIPPER_OPEN_RAD,
+    HIGH_APPROACH_INNER_WIDTH,
+    MIN_CARTESIAN_FRACTION,
+    NARROW_DESCENT_INNER_WIDTH,
     PICK_TCP_Z,
+    PIECE_COLLISION,
+    PIECE_PHYSICAL,
     PIECE_SPECS,
     COLLISION_ENABLED,
     REACHABILITY_EXECUTE_ON_FAKESYSTEM,
+    SQUARE_SIZE,
+    VERTICAL_CLEARANCE,
     approach_tcp_z,
     discard_slot_pose,
     square_to_grasp_pose,
@@ -68,20 +87,20 @@ from .chess_utils import (
     square_to_xy,
 )
 
-# ==== TODO: thay bằng thông số robot 6DOF thật của bạn (giống config đã dùng cho task ấm trà) ====
+# Dofbot: 5 joints arm (arm_group) + 1 gripper joint (grip_group, mimic).
+# Tên repo "6dof" = 5+1. Đã đối chiếu SRDF arm_group/up = [0,0,0,0,0].
 JOINT_NAMES = ["arm1_Joint", "arm2_Joint", "arm3_Joint", "arm4_Joint", "arm5_Joint"]
 BASE_LINK = "base_link"
 END_EFFECTOR = "Gripping_point_Link"
 GROUP_NAME = "arm_group"
 GRIPPER_JOINT = "Rlink1_Joint"
 GRIPPER_GROUP = "grip_group"
-# Toàn bộ các link thực sự của ngón. Khi object đã attach, MoveIt được phép cho
-# object chạm các link này, nhưng vẫn kiểm tra va chạm với tay/bàn/quân khác.
+# Link ngón được phép chạm quân đang mang (canonical attachObject touch_links:
+# chỉ ngón + tip). arm5_Link (palm/đế) đã bỏ khỏi danh sách: quân q/k cao chạm
+# palm phải được planner phát hiện, không che bằng ACM. Object vẫn luôn là vật
+# cản với tay/bàn/quân khác.
 GRIPPER_TOUCH_LINKS = [
     END_EFFECTOR,
-    # Palm/đế của cụm kẹp. Quân hậu/vua cao chạm phần này khi hai ngón kẹp
-    # đúng thân quân; chỉ được phép với CHÍNH quân đang gắp qua ACM tạm thời.
-    "arm5_Link",
     "Rlink1_Link", "Rlink2_Link", "Rlink3_Link",
     "Llink1_Link", "Llink2_Link", "Llink3_Link",
 ]
@@ -91,15 +110,27 @@ HOME_JOINTS = [0.0, 0.0, 0.0, 0.0, 0.0]
 # Không thử nhiều yaw: IK position-only của Dofbot bỏ qua quaternion nên 8 yaw
 # thường cùng rơi vào một orientation FK. Một candidate ban đầu sẽ được bù XYZ
 # lặp theo chính FK endpoint cho tới khi tâm quân đạt yêu cầu.
+# PLACE_YAW_COUNT=1 có chủ ý (không phải TODO): verified_quat sort bên dưới là
+# no-op với 1 candidate, giữ tham số để tương thích caller cũ.
 PLACE_YAW_COUNT = 1
-PLACE_YAW_STEP_DEG = 45.0
-# Chỉ tâm quân quyết định PASS khi đặt. Orientation/yaw/tilt của quân được ghi
-# log để chẩn đoán nhưng không còn là constraint của bài toán chơi cờ này.
+PLACE_YAW_STEP_DEG = 45.0  # không dùng khi YAW_COUNT=1, giữ để khỏi sửa caller
+# Chỉ tâm quân quyết định PASS khi đặt. Tilt là BỘ LỌC MỀM (không phải path
+# constraint — arm 5DOF + position-only IK không khóa quaternion tuyệt đối):
+# <0.20 rad rất tốt (thoát sớm), 0.20-0.45 chấp nhận nếu collision-free,
+# >0.45 từ chối và thử nghiệm IK khác. Đo bằng FK endpoint, log RViz để đo.
+PREFERRED_TILT_RAD = 0.20
+MAX_ACCEPTED_TILT_RAD = 0.45
 PLACE_POSITION_TOL_M = 0.005
-# Sau grasp chỉ lift Cartesian một đoạn ngắn để rời mặt bàn/quân lân cận;
-# phần di chuyển xa giao cho OMPL position-only. Ép giữ orientation suốt một
-# lift dài là nguyên nhân các ô gần biên/đế như b1 chỉ đạt Cartesian ~33%.
-CARRY_CLEARANCE_LIFT_M = 0.020
+# Sau detach giữ touch ACM trong lúc retreat; chỉ đóng khi TCP đã cách quân
+# đủ xa. Retreat hiện tại 65mm >> ngưỡng 10mm nên luôn thỏa, hằng số này để
+# test/hardware sau kiểm chứng tường minh thay vì đoán.
+ACM_RELEASE_CLEARANCE_M = 0.010
+# Đã đứng sẵn ở approach (transfer vừa execute tới đó) thì bỏ qua OMPL
+# pre-place zero-length, descend thẳng từ state hiện tại.
+PREPLACE_SKIP_TOL_M = 0.004
+# Clearance chung 65mm (CHỐT): pre-grasp = lift = retreat = grasp + 0.065.
+# Retreat về approach_z nên không cần hằng số riêng.
+CARRY_CLEARANCE_LIFT_M = VERTICAL_CLEARANCE
 # Số vòng fixed-point correction cho TCP place. Vì log cho thấy TCP FK đạt đúng
 # XYZ yêu cầu, cộng trực tiếp sai số tâm quân vào XYZ TCP sẽ hội tụ nhanh dù
 # orientation FK thay đổi nhẹ theo vị trí.
@@ -117,6 +148,9 @@ CACHED_LOCAL_ANG_TOL_DEG = 8.0
 # GetStateValidity là kiểm tra rời rạc; nội suy waypoint cached sao cho mỗi
 # joint thay đổi tối đa khoảng 1.7° giữa hai mẫu để không chỉ kiểm endpoint.
 CACHED_COLLISION_SAMPLE_RAD = 0.03
+# Chuẩn Cartesian bàn thật: eef_step 2mm, fraction 0.98 theo spec.
+CARTESIAN_MAX_STEP_M = CARTESIAN_EEF_STEP
+CARTESIAN_FRACTION_THRESHOLD = MIN_CARTESIAN_FRACTION
 
 
 class PickPlaceNode(Node):
@@ -241,16 +275,14 @@ class PickPlaceNode(Node):
         return f"piece_{next(self._id_counter):03d}"
 
     def _setup_initial_scene(self):
-        """Thêm bàn cờ (1 box) + quân cờ (cylinder) vào PlanningScene theo đúng
-        vị trí bắt đầu chuẩn của chess.Board()."""
-        # d4 là tâm một ô; cộng nửa ô để thành đúng tâm bàn 8x8.
-        board_center_x, board_center_y = square_to_xy("d4")
+        """Thêm bàn cờ thật 24cm (1 box) + quân cờ (cylinder) vào PlanningScene
+        theo đúng vị trí bắt đầu chuẩn của chess.Board()."""
         if COLLISION_ENABLED:
             self.moveit2.add_collision_box(
                 id="chessboard",
-                position=[board_center_x + 0.5 * 0.027, board_center_y + 0.5 * 0.027, BOARD_Z - 0.01],
+                position=[BOARD_CENTER_X, BOARD_CENTER_Y, BOARD_CENTER_Z],
                 quat_xyzw=[0.0, 0.0, 0.0, 1.0],
-                size=[0.216, 0.216, 0.02],
+                size=[BOARD_SIZE_X, BOARD_SIZE_Y, BOARD_THICKNESS],
             )
 
         self._publish_board_visual(publish=False)
@@ -273,13 +305,13 @@ class PickPlaceNode(Node):
         if not COLLISION_ENABLED:
             return
         x, y, z = xyz
-        spec = PIECE_SPECS[piece_type]
+        col = PIECE_COLLISION[piece_type]
         self.moveit2.add_collision_cylinder(
             id=obj_id,
-            position=[x, y, z + spec.pickup_height / 2],
+            position=[x, y, z + col["height"] / 2],
             quat_xyzw=[0.0, 0.0, 0.0, 1.0],
-            height=spec.pickup_height,
-            radius=0.012,
+            height=col["height"],
+            radius=col["radius"],
         )
 
     def _publish_board_visual(self, publish: bool = True):
@@ -299,7 +331,7 @@ class PickPlaceNode(Node):
             marker.pose.position.y = y
             marker.pose.position.z = BOARD_Z - 0.004
             marker.pose.orientation.w = 1.0
-            marker.scale.x = marker.scale.y = 0.027
+            marker.scale.x = marker.scale.y = SQUARE_SIZE
             marker.scale.z = 0.006
             # a1 đậm như bàn cờ chuẩn; tránh dùng alpha 0 vì RViz sẽ ẩn marker.
             light = (chess.square_file(square) + chess.square_rank(square)) % 2 == 1
@@ -316,7 +348,7 @@ class PickPlaceNode(Node):
     def _publish_piece_visual(self, obj_id: str, xyz, publish: bool = True):
         piece_type, is_white = self.piece_info_by_id[obj_id]
         x, y, z = xyz
-        spec = PIECE_SPECS[piece_type]
+        phys = PIECE_PHYSICAL[piece_type]
         marker = Marker()
         marker.header.frame_id = BASE_LINK
         marker.ns = "chess_pieces"
@@ -325,10 +357,10 @@ class PickPlaceNode(Node):
         marker.action = Marker.ADD
         marker.pose.position.x = x
         marker.pose.position.y = y
-        marker.pose.position.z = z + spec.pickup_height / 2
+        marker.pose.position.z = z + phys["height"] / 2
         marker.pose.orientation.w = 1.0
-        marker.scale.x = marker.scale.y = 0.021
-        marker.scale.z = spec.pickup_height
+        marker.scale.x = marker.scale.y = phys["diameter"]
+        marker.scale.z = phys["height"]
         if is_white:
             marker.color.r, marker.color.g, marker.color.b = 0.96, 0.96, 0.88
         else:
@@ -346,7 +378,7 @@ class PickPlaceNode(Node):
         demo bỏ collision object khỏi PlanningScene.
         """
         piece_type, is_white = self.piece_info_by_id[obj_id]
-        spec = PIECE_SPECS[piece_type]
+        phys = PIECE_PHYSICAL[piece_type]
         marker = Marker()
         marker.header.frame_id = END_EFFECTOR
         marker.ns = "chess_pieces"
@@ -354,8 +386,8 @@ class PickPlaceNode(Node):
         marker.type = Marker.CYLINDER
         marker.action = Marker.ADD
         marker.pose = local_pose
-        marker.scale.x = marker.scale.y = 0.021
-        marker.scale.z = spec.pickup_height
+        marker.scale.x = marker.scale.y = phys["diameter"]
+        marker.scale.z = phys["height"]
         if is_white:
             marker.color.r, marker.color.g, marker.color.b = 0.96, 0.96, 0.88
         else:
@@ -1154,7 +1186,7 @@ class PickPlaceNode(Node):
         từ 'world object' đứng yên trên bàn sang 'attached object' dính vào
         END_EFFECTOR, để nó trôi theo cánh tay trong suốt Lift->Move->Place.
         Trả về obj_id để hàm gọi truyền tiếp cho _detach_piece."""
-        spec = PIECE_SPECS[piece_type]
+        col = PIECE_COLLISION[piece_type]
         # Pose tương đối so với END_EFFECTOR lấy từ TF hiện tại. Nhờ vậy object
         # giữ đúng pose world lúc kẹp, kể cả TCP không song song trục Z của bàn.
         # pick_xyz có thể lệch trong ô; collision object vẫn lấy tâm quân thật.
@@ -1176,7 +1208,7 @@ class PickPlaceNode(Node):
 
         primitive = SolidPrimitive()
         primitive.type = SolidPrimitive.CYLINDER
-        primitive.dimensions = [spec.pickup_height, 0.012]  # [height, radius]
+        primitive.dimensions = [col["height"], col["radius"]]  # [height, radius]
         aco.object.primitives = [primitive]
         aco.object.primitive_poses = [pose]
         aco.touch_links = GRIPPER_TOUCH_LINKS
@@ -1513,7 +1545,7 @@ class PickPlaceNode(Node):
                         position=[x0, y0, z0], quat_xyzw=grasp_q,
                         target_link=END_EFFECTOR, tolerance_position=0.002,
                         tolerance_orientation=0.03, cartesian=True,
-                        max_step=0.002, cartesian_fraction_threshold=0.999))
+                        max_step=CARTESIAN_MAX_STEP_M, cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD))
                 self._dry_segment(
                     failures, "transfer", f"{square}->{target_square}",
                     lambda: self._plan_or_raise(
@@ -1527,7 +1559,7 @@ class PickPlaceNode(Node):
                         position=[tx, ty, tz], quat_xyzw=grasp_q,
                         target_link=END_EFFECTOR, tolerance_position=0.002,
                         tolerance_orientation=0.03, cartesian=True,
-                        max_step=0.002, cartesian_fraction_threshold=0.999))
+                        max_step=CARTESIAN_MAX_STEP_M, cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD))
         finally:
             obj_id = self.piece_id_by_square.get(square)
             if (obj_id and COLLISION_ENABLED
@@ -1590,7 +1622,7 @@ class PickPlaceNode(Node):
         if not COLLISION_ENABLED:
             return ""
         obj_id = "__dry_carry__"
-        spec = PIECE_SPECS[piece_type]
+        col = PIECE_COLLISION[piece_type]
         pose = copy.deepcopy(local_pose)
         # Validate strict: pose proxy rác mà attach mù sẽ cho kết quả mang giả.
         self._normalize_quaternion(
@@ -1609,7 +1641,7 @@ class PickPlaceNode(Node):
         aco.object.operation = CollisionObject.ADD
         primitive = SolidPrimitive()
         primitive.type = SolidPrimitive.CYLINDER
-        primitive.dimensions = [spec.pickup_height, 0.012]
+        primitive.dimensions = [col["height"], col["radius"]]
         aco.object.primitives = [primitive]
         aco.object.primitive_poses = [pose]
         aco.touch_links = GRIPPER_TOUCH_LINKS
@@ -1719,7 +1751,7 @@ class PickPlaceNode(Node):
                         position=[xd, yd, dz], quat_xyzw=q,
                         target_link=END_EFFECTOR, tolerance_position=0.002,
                         tolerance_orientation=0.03, cartesian=True,
-                        max_step=0.002, cartesian_fraction_threshold=0.999))
+                        max_step=CARTESIAN_MAX_STEP_M, cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD))
         except Exception as exc:
             failures.setdefault("discard", []).append(f"slot{slot}: {exc}")
             details = getattr(self, "_reachability_failure_details", None)
@@ -2016,6 +2048,14 @@ class PickPlaceNode(Node):
             self._grasp_local_by_id.pop(obj_id, None)
             self._move_vertical(place_tcp[0], place_tcp[1], target_approach_z,
                                "nâng sau đặt", quat_xyzw=place_tcp[3])
+            # Giữ touch ACM trong suốt retreat; chỉ đóng khi TCP đã cách quân
+            # đủ xa. Retreat 65mm >> ACM_RELEASE_CLEARANCE 10mm nên luôn thỏa;
+            # log tường minh để test/hardware đo kiểm thay vì đoán.
+            retreat_lift = target_approach_z - place_tcp[2]
+            self.get_logger().info(
+                f"[ACM-RELEASE] {from_sq}->{to_sq}: retreat "
+                f"{retreat_lift * 1000:.0f}mm >= "
+                f"{ACM_RELEASE_CLEARANCE_M * 1000:.0f}mm -> đóng ACM")
             # Đã rút khỏi quân: đóng mọi ngoại lệ ngay tại phase boundary.
             self._set_piece_collision(
                 obj_id, gripper_touch=False, board_contact=False)
@@ -2079,6 +2119,10 @@ class PickPlaceNode(Node):
             self._move_vertical(drop_tcp[0], drop_tcp[1],
                                discard_tcp_z + APPROACH_HEIGHT,
                                "nâng sau thả quân bị ăn", quat_xyzw=drop_tcp[3])
+            self.get_logger().info(
+                f"[ACM-RELEASE] discard {square}->slot{slot}: retreat "
+                f"{(discard_tcp_z + APPROACH_HEIGHT - drop_tcp[2]) * 1000:.0f}mm "
+                f">= {ACM_RELEASE_CLEARANCE_M * 1000:.0f}mm -> đóng ACM")
             self._set_piece_collision(
                 obj_id, gripper_touch=False, board_contact=False)
             self._release_contact_object_ids.discard(obj_id)
@@ -2417,6 +2461,17 @@ class PickPlaceNode(Node):
         qn = self._normalize_quaternion((q.x, q.y, q.z, q.w))
         return [qn[0], qn[1], qn[2], qn[3]]
 
+    def _current_tcp_xyz(self) -> tuple[float, float, float]:
+        """Vị trí TCP hiện tại qua TF (dùng để skip pre-place thừa)."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                BASE_LINK, END_EFFECTOR, rclpy.time.Time()
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Không đọc được TF {BASE_LINK}->{END_EFFECTOR}: {exc}")
+        t = transform.transform.translation
+        return (float(t.x), float(t.y), float(t.z))
+
     def _fk_tcp_pose(self, joint_names, joint_positions):
         """FK qua /compute_fk ra pose TCP (xyz + quat). Fail-closed: service
         vắng thì raise thay vì cho execute mù."""
@@ -2633,8 +2688,8 @@ class PickPlaceNode(Node):
                             target_link=END_EFFECTOR,
                             tolerance_position=0.002,
                             tolerance_orientation=0.03,
-                            cartesian=True, max_step=0.002,
-                            cartesian_fraction_threshold=0.999)
+                            cartesian=True, max_step=CARTESIAN_MAX_STEP_M,
+                            cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD)
                     finally:
                         self._set_piece_collision(
                             scratch_id, gripper_touch=True,
@@ -2727,30 +2782,25 @@ class PickPlaceNode(Node):
 
         quat_xyzw: orientation giữ suốt đoạn đi. Nên truyền quaternion đã chốt
         sau approach (xem _current_tcp_quat); None = đọc TF hiện tại (giữ hành
-        vi cũ cho caller đơn lẻ). Plan fail mới raise rõ ràng thay vì fallback
-        âm thầm (trừ khi ALLOW_CARTESIAN_FALLBACK=True được bật tường minh cho
-        demo). Bước HẠ ĐẶT không dùng hàm này mà dùng _move_vertical_place để
+        vi cũ cho caller đơn lẻ). Plan fail thì raise rõ ràng — KHÔNG fallback
+        position-only (kể cả khi ALLOW_CARTESIAN_FALLBACK=True, vì fallback lúc
+        đang ATTACHED sẽ làm rơi/lệch quân mà flow vẫn attach như thành công).
+        Bước HẠ ĐẶT không dùng hàm này mà dùng _move_vertical_place để
         FK-validate pose quân trước execute.
         """
         q = quat_xyzw if quat_xyzw is not None else self._current_tcp_quat()
         trajectory = self._plan_vertical_or_raise(x, y, z, q, step_name)
-        if trajectory is None:
-            self.get_logger().warning(
-                f"Cartesian không đủ tại {step_name}; dùng position-only fallback tới {(x, y, z)}"
-            )
-            self._move_to(x, y, z)
-            return
         self._execute_and_wait(self.moveit2, trajectory)
 
     def _plan_vertical_or_raise(self, x, y, z, q, step_name: str):
-        """Plan Cartesian hoặc raise (kèm chẩn đoán), giữ nguyên fallback opt-in."""
+        """Plan Cartesian hoặc raise (kèm chẩn đoán). Không fallback opt-in:
+        ALLOW_CARTESIAN_FALLBACK chỉ còn là cờ tài liệu, mọi caller đều
+        fail-loud để NACK thay vì đặt lệch."""
         trajectory = self._plan_vertical_trajectory(x, y, z, q, step_name)
         if trajectory is None:
             self._diagnose_position_goal_collision(
                 (x, y, z), q, f"cartesian/{step_name}/{(x, y, z)}"
             )
-            if not COLLISION_ENABLED and ALLOW_CARTESIAN_FALLBACK:
-                return None
             raise RuntimeError(
                 f"Không có Cartesian path an toàn khi {step_name} tới {(x, y, z)} "
                 f"(quat giữ {[round(v, 3) for v in q]}). "
@@ -2768,15 +2818,10 @@ class PickPlaceNode(Node):
         caller cũ; flow mới dùng compensation lặp theo FK.
         """
         if approach_z is None:
-            # Legacy: descend trực tiếp, caller tự quản ACM.
+            # Legacy: descend trực tiếp, caller tự quản ACM. Fail-loud:
+            # không fallback position-only khi hạ đặt.
             trajectory = self._plan_vertical_or_raise(
                 *place_tcp[:3], place_tcp[3], step_name)
-            if trajectory is None:
-                self.get_logger().warning(
-                    f"Cartesian không đủ tại {step_name}; dùng position-only "
-                    f"fallback tới {place_tcp[:3]}")
-                self._move_to(*place_tcp[:3])
-                return place_tcp
             self._validate_place_trajectory_end(
                 trajectory, obj_id, target_xy, piece_type, place_tcp,
                 step_name)
@@ -3119,47 +3164,69 @@ class PickPlaceNode(Node):
 
         Robot đang ATTACHED ở approach đích. Mỗi vòng chỉ plan: FK endpoint
         cho tâm quân dự kiến, sau đó dịch XYZ TCP ngược sai số và plan lại.
-        Quaternion không quyết định PASS và không đổi giữa các vòng.
-        Phase lateral (transit → pre-place): board_contact ĐÓNG để đường đi
-        của tay + quân được check va chạm bàn. Ngoại lệ board chỉ MỞ cho đúng
-        đoạn descend thẳng đứng pre-place → place.
+        Descend là computeCartesianPath thật (IK/Jacobian + collision mỗi
+        waypoint 2mm, fraction 0.98) — KHÔNG phải cộng tay vào joint.
+        Tilt là bộ lọc mềm: thoát sớm khi <=0.20 rad, chấp nhận tới 0.45,
+        trên 0.45 thì loại và thử nghiệm khác. Đã đứng sẵn ở approach thì bỏ
+        qua OMPL pre-place zero-length (gộp transfer/pre-place).
+        Phase lateral: board_contact ĐÓNG; chỉ MỞ cho đúng đoạn descend.
 
         Không hội tụ thì raise khi arm CHƯA hề nhúc nhích. Chỉ execute cặp
         pre-place/descend cuối đã đưa tâm quân vào sai số 5 mm.
         Trả về place_tcp đã execute thành công (board-contact đang MỞ, caller
-        verify → detach → retreat rồi mới đóng lại).
+        verify → detach → retreat 65mm rồi mới đóng lại, thỏa clearance 10mm).
         """
         self._set_piece_collision(
             obj_id, gripper_touch=True, board_contact=False)
         errors = []
+        converged = []  # (tilt, pos_err, pre, desc, place_tcp, label)
         chosen = None
         for rank, place_tcp in enumerate(place_candidates, 1):
             for correction in range(PLACE_COMPENSATION_MAX_ITERATIONS):
                 px, py, pz, pq = (place_tcp[0], place_tcp[1],
                                   place_tcp[2], place_tcp[3])
                 label = f"{step_name}/comp{correction + 1}"
+                # Gộp transfer/pre-place: transfer vừa execute tới đúng
+                # approach thì pre-place OMPL tới cùng điểm là thừa.
                 try:
+                    cur_xyz = self._current_tcp_xyz()
+                except Exception:
+                    cur_xyz = None
+                if (cur_xyz is not None
+                        and math.sqrt((cur_xyz[0] - px) ** 2
+                                      + (cur_xyz[1] - py) ** 2
+                                      + (cur_xyz[2] - approach_z) ** 2)
+                        <= PREPLACE_SKIP_TOL_M):
+                    pre = None
+                    self._wait_for_joint_state(self.moveit2)
+                    pre_end = copy.deepcopy(self.moveit2.joint_state)
+                    pre_q = self._current_tcp_quat()
+                    self.get_logger().info(
+                        f"[PREPLACE-SKIP] {label}: đã ở approach, "
+                        f"descend thẳng không OMPL lại")
+                else:
                     # Transfer/pre-place là chuyển động xa hoặc dịch ngang:
                     # dùng OMPL position-only để được đổi nhánh khớp. Chỉ
                     # descend cuối mới bắt buộc Cartesian.
-                    pre = self._plan_motion(
-                        position=[px, py, approach_z],
-                        target_link=END_EFFECTOR,
-                        tolerance_position=0.002, cartesian=False)
-                except Exception as exc:
-                    errors.append(f"{label}: pre-place plan lỗi ({exc})")
-                    break
-                if pre is None:
-                    errors.append(f"{label}: không có OMPL pre-place")
-                    break
-                try:
-                    pre_end = self._joint_state_from_trajectory_end(pre)
-                    pre_last = pre.points[-1]
-                    _pre_xyz, pre_q = self._fk_tcp_pose(
-                        pre.joint_names, pre_last.positions)
-                except Exception as exc:
-                    errors.append(f"{label}: endpoint pre-place xấu ({exc})")
-                    break
+                    try:
+                        pre = self._plan_motion(
+                            position=[px, py, approach_z],
+                            target_link=END_EFFECTOR,
+                            tolerance_position=0.002, cartesian=False)
+                    except Exception as exc:
+                        errors.append(f"{label}: pre-place plan lỗi ({exc})")
+                        break
+                    if pre is None:
+                        errors.append(f"{label}: không có OMPL pre-place")
+                        break
+                    try:
+                        pre_end = self._joint_state_from_trajectory_end(pre)
+                        pre_last = pre.points[-1]
+                        _pre_xyz, pre_q = self._fk_tcp_pose(
+                            pre.joint_names, pre_last.positions)
+                    except Exception as exc:
+                        errors.append(f"{label}: endpoint pre-place xấu ({exc})")
+                        break
                 try:
                     self._set_piece_collision(
                         obj_id, gripper_touch=True, board_contact=True)
@@ -3170,8 +3237,8 @@ class PickPlaceNode(Node):
                             target_link=END_EFFECTOR,
                             tolerance_position=0.002,
                             tolerance_orientation=0.03,
-                            cartesian=True, max_step=0.002,
-                            cartesian_fraction_threshold=0.999)
+                            cartesian=True, max_step=CARTESIAN_MAX_STEP_M,
+                            cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD)
                     finally:
                         self._set_piece_collision(
                             obj_id, gripper_touch=True,
@@ -3196,13 +3263,21 @@ class PickPlaceNode(Node):
                     break
                 if pos_err <= PLACE_POSITION_TOL_M:
                     place_tcp = (px, py, pz, fq)
+                    converged.append((tilt, pos_err, pre, desc, place_tcp, label))
                     self.get_logger().info(
-                        f"[PLACE-COMP] {step_name}: đạt sau "
-                        f"{correction + 1}/{PLACE_COMPENSATION_MAX_ITERATIONS} "
-                        f"lần, lệch {pos_err * 1000:.1f}mm; "
-                        f"tilt tham khảo {math.degrees(tilt):.1f}°")
-                    chosen = (pre, desc, place_tcp)
-                    break
+                        f"[PLACE-COMP] {step_name}: {label} đạt, lệch "
+                        f"{pos_err * 1000:.1f}mm; "
+                        f"tilt {math.degrees(tilt):.1f}° "
+                        f"(ưu <={math.degrees(PREFERRED_TILT_RAD):.0f}°, "
+                        f"chịu <={math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°)")
+                    if tilt <= PREFERRED_TILT_RAD:
+                        break  # rất tốt: chốt ngay, khỏi bù tiếp
+                    # Chưa tốt nhưng đạt tâm: bù tiếp xem vòng sau có tilt
+                    # thấp hơn không; quyết định cuối chọn tilt min.
+                    corrected = self._compensate_place_tcp(
+                        place_tcp, center, target_xy, piece_type)
+                    place_tcp = corrected
+                    continue
                 corrected = self._compensate_place_tcp(
                     place_tcp, center, target_xy, piece_type)
                 self.get_logger().info(
@@ -3212,8 +3287,26 @@ class PickPlaceNode(Node):
                     f"{(corrected[1] - py) * 1000:.1f}, "
                     f"{(corrected[2] - pz) * 1000:.1f})mm")
                 place_tcp = corrected
-            if chosen is not None:
-                break
+            # Hết vòng bù của rank này mà chưa break sớm: sang rank tiếp theo
+            # (nếu còn) để tìm nghiệm tilt thấp hơn.
+        if converged:
+            # Chọn tilt nhỏ nhất trong các nghiệm đã đạt tâm (log RViz để đo).
+            converged.sort(key=lambda item: (item[0], item[1]))
+            best_tilt = converged[0][0]
+            self.get_logger().info(
+                f"[TILT-SELECT] {step_name}: {len(converged)} nghiệm đạt tâm, "
+                + ", ".join(
+                    f"{lab} tilt={math.degrees(t):.1f}° err={e * 1000:.1f}mm"
+                    for t, e, _p, _d, _tcp, lab in converged)
+                + f" -> chọn tilt={math.degrees(best_tilt):.1f}°")
+            if best_tilt > MAX_ACCEPTED_TILT_RAD:
+                raise RuntimeError(
+                    f"{step_name}: mọi nghiệm đạt tâm đều nghiêng "
+                    f">{math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}° "
+                    f"(tốt nhất {math.degrees(best_tilt):.1f}°); từ chối để "
+                    f"thử nước/offset khác (arm chưa di chuyển)")
+            _bt, _be, pre, desc, place_tcp, _bl = converged[0]
+            chosen = (pre, desc, place_tcp)
         if chosen is None:
             raise RuntimeError(
                 f"FK cuối trajectory {step_name} không đưa tâm quân vào "
@@ -3261,8 +3354,8 @@ class PickPlaceNode(Node):
                 tolerance_position=0.002,
                 tolerance_orientation=0.03,
                 cartesian=True,
-                max_step=0.002,
-                cartesian_fraction_threshold=0.999,
+                max_step=CARTESIAN_MAX_STEP_M,
+                cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD,
             )
             if trajectory is not None:
                 if attempt == 2:
@@ -3275,9 +3368,11 @@ class PickPlaceNode(Node):
     def _set_gripper(self, opening: float):
         if GRIPPER_JOINT is None:
             return
-        # Rlink1_Joint điều khiển cả hai ngón trong URDF Dofbot qua mimic joints.
-        # Giá trị 0 là mở, 1.57 rad là đóng (named states open/close trong SRDF).
-        target = 0.0 if opening > 0.0 else 1.57
+        # Rlink1_Joint điều khiển cả hai ngón qua mimic joints.
+        # Binary CHỐT (mimic phi tuyến, cấm nội suy tuyến tính): mở 0.0,
+        # đóng 1.57. Muốn 3 phase 20/14/12mm phải có bảng FK
+        # gripper_width_to_joint_angle rồi hiệu chỉnh servo thật.
+        target = GRIPPER_OPEN_RAD if opening > 0.0 else GRIPPER_CLOSED_RAD
         self._wait_for_joint_state(self.gripper)
         self.gripper.move_to_configuration(
             joint_positions=[target], joint_names=[GRIPPER_JOINT]

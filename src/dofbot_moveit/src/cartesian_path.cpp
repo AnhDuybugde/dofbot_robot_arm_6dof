@@ -97,10 +97,11 @@ public:
       // 计算笛卡尔路径
       moveit_msgs::msg::RobotTrajectory trajectory_msg;
       double jump_threshold = 0.0;
-      double eef_step = 0.005;
-      double fraction = move_group_interface_->computeCartesianPath(waypoints, eef_step, jump_threshold, trajectory_msg);
+      static constexpr double kEefStep = 0.01;  // chuẩn tutorial move_group_interface
+      static constexpr double kMinExecutableFraction = 0.95;  // chuẩn trajectory_cache_demo
+      double fraction = move_group_interface_->computeCartesianPath(waypoints, kEefStep, jump_threshold, trajectory_msg);
 
-      if (fraction >= 0.0)
+      if (fraction >= kMinExecutableFraction)
       {
         RCLCPP_INFO(this->get_logger(), "Cartesian path planned successfully (%.2f%% achieved)", fraction * 100.0);
 

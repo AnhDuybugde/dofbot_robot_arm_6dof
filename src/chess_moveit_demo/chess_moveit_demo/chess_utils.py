@@ -7,19 +7,26 @@ CHỈNH các hằng số bên dưới theo bàn cờ ảo bạn dựng trong RVi
 
 from dataclasses import dataclass
 
-# ==== THAM SỐ CALIBRATION (chỉnh theo bàn cờ mô phỏng của bạn) ====
-# Bàn được tịnh tiến xa theo +X để các ô hàng 1--2 không chồng lên đế robot.
-# a1 = (0.095, -0.095); h8 = (0.284, 0.094); riêng e2 = (0.122, 0.013).
-# Đo IK sweep /compute_ik 09/2026 (26 pose pick+approach): ox=0.095 PASS 26/26;
-# mọi ox>=0.100 làm rớt pick góc xa a8/h8, ox>=0.110 rớt cả approach a8/h8.
-# Giữ 0.095 (tối ưu IK toàn bàn). Lỗi approach hàng 1 gặp ở runtime là tầng
-# OMPL planning (goal sampling/self-collision/start state), KHÔNG phải IK —
-# check_reachability đo đúng tầng đó nên mới thấy. Khi dùng bàn thật,
-# calibrate lại theo vị trí vật lý.
-BOARD_ORIGIN = (0.095, -0.095, 0.005)  # toạ độ tâm ô a1 so với base_link (m)
-SQUARE_SIZE = 0.027                     # cạnh ô (m)
-BOARD_Z = 0.005                         # cao độ mặt bàn cờ so với base_link (m)
-APPROACH_HEIGHT = 0.070                 # độ cao approach/lift phía trên quân cờ (m)
+# ==== BÀN CỜ THẬT 24 cm (đơn vị mét trong MoveIt) — CHỐT ====
+# Mapping: X=rank, Y=file (giữ hàng 1 gần robot đã verify IK, không xoay).
+BOARD_SIZE_X = 0.240
+BOARD_SIZE_Y = 0.240
+BOARD_THICKNESS = 0.020
+BOARD_TOP_Z = 0.005
+BOARD_CENTER_X = 0.2015
+BOARD_CENTER_Y = -0.0005
+BOARD_CENTER_Z = -0.005
+BOARD_CENTER = (0.2015, -0.0005)
+BOARD_COLLISION_CENTER = (0.2015, -0.0005, -0.005)
+BOARD_COLLISION_SIZE = (0.240, 0.240, 0.020)
+BOARD_ORIGIN = (0.1105, -0.0915, 0.005)  # tâm ô a1
+SQUARE_SIZE = 0.026
+BOARD_BORDER = 0.016
+# Alias tương thích code cũ dùng BOARD_Z làm mặt bàn.
+BOARD_Z = BOARD_TOP_Z
+# Clearance chung 65mm: approach = lift = retreat = grasp + 0.065.
+VERTICAL_CLEARANCE = 0.065
+APPROACH_HEIGHT = VERTICAL_CLEARANCE
 # Bốn ô giữa của hàng 1 nằm gần đế Dofbot nhất (X nhỏ nhất).  TCP ở
 # PICK_TCP_Z + 70 mm rơi vào vùng không có IK tại các ô này, trong khi TCP ở
 # 100 mm vẫn có IK.  Chỉ hạ *điểm approach* tại đây; khi mang quân theo phương
@@ -37,11 +44,8 @@ LOW_APPROACH_SQUARES = frozenset({"c1", "d1", "e1", "f1"})
 #   e1 -> 0.070, d1 -> 0.080. Khi gắp, ACM chỉ mở contact tạm thời giữa quân
 # mục tiêu với link kẹp/mặt bàn; các collision khác vẫn được kiểm tra.
 SQUARE_APPROACH_OFFSET = {"e1": 0.015, "d1": 0.025}
-# Cao độ TCP (Gripping_point_Link) tại lúc ngón kẹp đúng quân. Đây là tham số
-# calibration của ROBOT, không phải chiều cao của quân.  Bắt đầu ở 55 mm để
-# tránh TCP chạm bàn; hãy tune +/- 2--3 mm trên RViz rồi mới dùng robot thật.
-PICK_TCP_Z = 0.055
-DISCARD_TCP_Z = PICK_TCP_Z
+# PICK_TCP_Z / DISCARD_TCP_Z / PIECE_GRIP_Z định nghĩa ở cụm bàn thật bên dưới
+# (TCP = TOP + GRASP_H + OFFSET), không dùng giá trị demo 0.055 nữa.
 
 # Hai cờ này CỐ Ý độc lập. Bật collision không được làm deep-check đổi từ
 # EXECUTE sang plan-only, vì cần kiểm tra đúng state chaining trên FakeSystem.
@@ -49,20 +53,20 @@ DISCARD_TCP_Z = PICK_TCP_Z
 COLLISION_ENABLED = True
 REACHABILITY_EXECUTE_ON_FAKESYSTEM = True
 
-# Cartesian descend/lift KHÔNG được fallback âm thầm sang position-only.
-# Fallback cũ chỉ warning rồi đi tiếp, khiến pick thất bại mà flow vẫn
-# đóng gripper/attach object như thành công. Giữ False để lỗi hiện rõ;
-# chỉ bật True khi demo và chấp nhận rủi ro đó một cách tường minh.
+# DEPRECATED (giữ để tương thích import): mọi Cartesian fail đều raise loud,
+# không fallback position-only kể cả khi cờ này True — fallback lúc ATTACHED
+# làm rơi/lệch quân mà flow vẫn attach như thành công.
 ALLOW_CARTESIAN_FALLBACK = False
 
 # Tổng thời gian tối đa cho tìm candidate gắp 1 ô (Fix 6): thử offset mà
 # không trần thời gian có thể treo lượt đi khi scene khó. Hết trần -> raise
 # để NACK thay vì thử mãi.
 GRASP_SEARCH_TIMEOUT_SEC = 120.0
-# Bán kính collision của quân (12 mm, xem _add_piece_collision_at). Candidate
-# offset vượt quá bán kính này thì ngón kẹp chắc chắn trượt tâm quân (điều
-# kiện hình học tối thiểu; FakeSystem không kiểm chứng tiếp xúc vật lý thật).
-GRASP_MAX_OFFSET = 0.012
+# Bán kính collision nhỏ nhất (tốt p = 8.5mm). Candidate offset vượt quá
+# bán kính quân mục tiêu thì ngón kẹp chắc chắn trượt tâm (điều kiện hình học
+# tối thiểu; FakeSystem không kiểm chứng tiếp xúc vật lý thật). Giữ 8.5mm để
+# mọi loại quân đều an toàn.
+GRASP_MAX_OFFSET = 0.0085
 
 FILES = "abcdefgh"
 RANKS = "12345678"
@@ -74,14 +78,34 @@ class PieceSpec:
     gripper_open: float    # độ mở gripper (m hoặc rad, tuỳ cấu hình gripper của bạn)
 
 
-# Chiều cao/gripper xấp xỉ cho bộ cờ Staunton chuẩn - chỉnh theo bộ cờ thật/mô phỏng của bạn
+# Kích thước danh nghĩa quân thật (visual/RViz). Collision dùng bảng riêng
+# PIECE_COLLISION bên dưới (có margin +3mm cao, +0.5-1mm radius).
+PIECE_PHYSICAL = {
+    "p": {"height": 0.023, "diameter": 0.015},
+    "r": {"height": 0.027, "diameter": 0.016},
+    "n": {"height": 0.031, "diameter": 0.017},
+    "b": {"height": 0.035, "diameter": 0.017},
+    "q": {"height": 0.041, "diameter": 0.018},
+    "k": {"height": 0.047, "diameter": 0.018},
+}
+# Collision từng loại (margin an toàn so với physical).
+PIECE_COLLISION = {
+    "p": {"radius": 0.0085, "height": 0.026},
+    "r": {"radius": 0.0090, "height": 0.030},
+    "n": {"radius": 0.0095, "height": 0.034},
+    "b": {"radius": 0.0095, "height": 0.038},
+    "q": {"radius": 0.0100, "height": 0.044},
+    "k": {"radius": 0.0100, "height": 0.050},
+}
+# Giữ tên cũ để không sửa mọi caller: pickup_height = collision height mới,
+# gripper_open giữ nguyên ngưỡng logic cũ (mở>0/đóng=0, xem _set_gripper).
 PIECE_SPECS = {
-    "p": PieceSpec(pickup_height=0.035, gripper_open=0.018),  # pawn
-    "n": PieceSpec(pickup_height=0.045, gripper_open=0.020),  # knight
-    "b": PieceSpec(pickup_height=0.055, gripper_open=0.018),  # bishop
-    "r": PieceSpec(pickup_height=0.045, gripper_open=0.022),  # rook
-    "q": PieceSpec(pickup_height=0.070, gripper_open=0.020),  # queen
-    "k": PieceSpec(pickup_height=0.075, gripper_open=0.020),  # king
+    "p": PieceSpec(pickup_height=0.026, gripper_open=0.018),
+    "r": PieceSpec(pickup_height=0.030, gripper_open=0.022),
+    "n": PieceSpec(pickup_height=0.034, gripper_open=0.020),
+    "b": PieceSpec(pickup_height=0.038, gripper_open=0.018),
+    "q": PieceSpec(pickup_height=0.044, gripper_open=0.020),
+    "k": PieceSpec(pickup_height=0.050, gripper_open=0.020),
 }
 
 # "Nghĩa địa" quân bị ăn: lưới 4x4=16 slot cạnh bàn phía -Y (bên file a),
@@ -97,18 +121,53 @@ DISCARD_DX = 0.033
 DISCARD_DY = 0.033
 DISCARD_MAX_SLOTS = DISCARD_COLS * DISCARD_ROWS  # 16
 
-# Cao độ TCP khi kẹp từng loại quân. Mặc định = PICK_TCP_Z cho tất cả để giữ
-# nguyên hành vi đã verify trong sim; tune từng loại trên RViz/robot thật
-# (quân cao như q/k có thể cần TCP cao hơn để ngón kẹp đúng thân thay vì
-# chạm đỉnh quân). Service /chess/check_reachability đã test theo bảng này.
-PIECE_GRIP_Z = {
-    "p": PICK_TCP_Z,  # pawn, cao 35 mm
-    "n": PICK_TCP_Z,  # knight, cao 45 mm
-    "b": PICK_TCP_Z,  # bishop, cao 55 mm
-    "r": PICK_TCP_Z,  # rook, cao 45 mm
-    "q": PICK_TCP_Z,  # queen, cao 70 mm
-    "k": PICK_TCP_Z,  # king, cao 75 mm
+# Điểm kẹp so với mặt bàn (chưa gồm offset TCP->điểm tiếp xúc ngón).
+PIECE_GRASP_HEIGHT = {
+    "p": 0.011, "r": 0.014, "n": 0.015, "b": 0.017, "q": 0.020, "k": 0.022,
 }
+# Offset TCP->điểm tiếp xúc: 30mm CHƯA đủ bằng chứng (mesh/joint/orientation
+# khi đóng đều ảnh hưởng) nên chỉ là estimate, không phải thông số chính thức.
+TCP_TO_CONTACT_OFFSET_Z_ESTIMATE = 0.030
+TCP_OFFSET_CALIBRATED = False
+# Mốc RViz neo theo TCP tốt cũ đã chạy được (55mm): offset tương thích
+# 55-5-11 = 39mm. Dùng tạm cho tới khi đo trên robot thật:
+#   OFFSET = measured_tcp_z - BOARD_TOP_Z - PIECE_GRASP_HEIGHT[type].
+TCP_TO_CONTACT_OFFSET_Z_SIM = 0.039
+PAWN_TCP_Z_REFERENCE = 0.055
+PICK_TCP_Z = PAWN_TCP_Z_REFERENCE
+DISCARD_TCP_Z = PICK_TCP_Z
+# Bảng SIM nhất quán với pawn 55mm (không phải calibration vật lý):
+# p=55, r=58, n=59, b=61, q=64, k=66mm.
+PIECE_GRIP_Z_SIM = {
+    "p": 0.055, "r": 0.058, "n": 0.059, "b": 0.061, "q": 0.064, "k": 0.066,
+}
+PIECE_GRIP_Z = dict(PIECE_GRIP_Z_SIM)
+# Gripper binary hiện tại (chưa map mm->rad vì mimic phi tuyến, cấm nội suy
+# tuyến tính angle = width/max*1.57). Mở hoàn toàn có thể rộng hơn ô 26mm.
+GRIPPER_OPEN_RAD = 0.0
+GRIPPER_CLOSED_RAD = 1.57
+# 3 phase widths tương lai: cần bảng FK/calibration joint->khoảng cách mặt
+# trong finger trước (đo trong RViz rồi hiệu chỉnh servo thật).
+HIGH_APPROACH_INNER_WIDTH = 0.020
+NARROW_DESCENT_INNER_WIDTH = 0.014
+FINAL_GRASP_INNER_WIDTH = 0.012
+HIGH_APPROACH_WIDTH = HIGH_APPROACH_INNER_WIDTH
+NARROW_DESCENT_WIDTH = NARROW_DESCENT_INNER_WIDTH
+FINAL_GRASP_WIDTH = FINAL_GRASP_INNER_WIDTH
+FINGER_THICKNESS = 0.006
+# Motion: bỏ RETREAT 40mm, dùng chung clearance 65mm cho cả 3 bước.
+CARTESIAN_EEF_STEP = 0.002
+MIN_CARTESIAN_FRACTION = 0.98
+
+
+def gripper_width_to_joint_angle(width_m: float) -> float:
+    """Map khoảng cách mặt trong finger -> joint angle. Chưa có bảng FK nên
+    raise để không ai nội suy tuyến tính sai. Tạo bảng joint->width bằng FK
+    RViz trước, hiệu chỉnh servo thật, rồi implement nội suy tại đây."""
+    raise NotImplementedError(
+        "Chưa có bảng calibration gripper_width_to_joint_angle; "
+        "giữ binary GRIPPER_OPEN/CLOSED_RAD."
+    )
 
 # Candidate lệch tâm cho GẮP, tính bằng mét. Pipeline luôn thử tâm trước, rồi
 # mở rộng hữu hạn 3 -> 6 -> 8 mm; không tìm vô hạn và không mở collision với
@@ -127,12 +186,19 @@ GRASP_APPROACH_CANDIDATE_OFFSETS = (
 
 
 def square_to_xy(square: str):
-    """'e4' -> (x, y) tâm ô, chưa cộng offset lệch tâm quân."""
-    file_idx = FILES.index(square[0])
-    rank_idx = RANKS.index(square[1])
+    """'e4' -> (x, y) tâm ô, chưa cộng offset lệch tâm quân.
+    CHỐT: X=rank, Y=file (hàng 1 gần robot)."""
+    file_idx = FILES.index(square[0].lower())
+    rank_idx = int(square[1]) - 1
     x = BOARD_ORIGIN[0] + rank_idx * SQUARE_SIZE
     y = BOARD_ORIGIN[1] + file_idx * SQUARE_SIZE
     return x, y
+
+
+def square_center(square: str):
+    """Tâm ô dạng (x, y, z) theo quy ước CHỐT X=rank/Y=file."""
+    x, y = square_to_xy(square)
+    return x, y, BOARD_ORIGIN[2]
 
 
 def square_to_grasp_pose(square: str, piece_type: str, offset_xy=(0.0, 0.0)):

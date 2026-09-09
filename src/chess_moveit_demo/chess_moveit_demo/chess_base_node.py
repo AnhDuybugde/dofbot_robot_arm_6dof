@@ -13,10 +13,13 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .chess_utils import BOARD_Z, PIECE_SPECS, square_to_xy
+from .chess_utils import BOARD_Z, PIECE_PHYSICAL, SQUARE_SIZE, square_to_xy
 
 
-FRAME_ID = "world"
+# Thống nhất với pick_place_node.BASE_LINK. SRDF virtual_joint world->base_link
+# là fixed nên hai frame trùng nhau, nhưng mọi marker/collision đều dùng
+# base_link để khỏi lệch TF khi RViz chỉ có base_link.
+FRAME_ID = "base_link"
 
 
 class ChessBaseNode(Node):
@@ -50,7 +53,7 @@ class ChessBaseNode(Node):
         marker.pose.position.x, marker.pose.position.y = x, y
         marker.pose.position.z = BOARD_Z - 0.004
         marker.pose.orientation.w = 1.0
-        marker.scale.x = marker.scale.y = 0.027
+        marker.scale.x = marker.scale.y = SQUARE_SIZE
         marker.scale.z = 0.006
         light = (chess.square_file(square) + chess.square_rank(square)) % 2 == 1
         marker.color.r = 0.93 if light else 0.20
@@ -61,7 +64,7 @@ class ChessBaseNode(Node):
 
     def _piece_marker(self, square: int, piece: chess.Piece) -> Marker:
         x, y = square_to_xy(chess.square_name(square))
-        spec = PIECE_SPECS[piece.symbol().lower()]
+        phys = PIECE_PHYSICAL[piece.symbol().lower()]
         marker = Marker()
         marker.header.frame_id = FRAME_ID
         marker.ns = "chess_pieces"
@@ -70,10 +73,10 @@ class ChessBaseNode(Node):
         marker.type = Marker.CYLINDER
         marker.action = Marker.ADD
         marker.pose.position.x, marker.pose.position.y = x, y
-        marker.pose.position.z = BOARD_Z + spec.pickup_height / 2
+        marker.pose.position.z = BOARD_Z + phys["height"] / 2
         marker.pose.orientation.w = 1.0
-        marker.scale.x = marker.scale.y = 0.021
-        marker.scale.z = spec.pickup_height
+        marker.scale.x = marker.scale.y = phys["diameter"]
+        marker.scale.z = phys["height"]
         if piece.color:
             marker.color.r, marker.color.g, marker.color.b = 0.96, 0.96, 0.88
         else:

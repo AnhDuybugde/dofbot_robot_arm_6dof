@@ -2,4 +2,8 @@ arm_group:
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.005
   kinematics_solver_timeout: 0.05
+  # Option A (đã chốt cho tay 5DOF): position-only IK. OMPL transfer/pre-place
+  # CHỈ dùng position constraint; quaternion truyền cho GetCartesianPath chỉ là
+  # waypoint orientation, KHÔNG phải IK/orientation constraint (KDL bỏ qua).
+  # Tâm quân được quyết định bởi FK-validate, không bởi yaw/tilt.
   position_only_ik: true
