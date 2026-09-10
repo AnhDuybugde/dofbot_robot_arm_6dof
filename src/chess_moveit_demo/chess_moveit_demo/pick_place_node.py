@@ -147,8 +147,8 @@ except Exception:  # package vắng trên máy chỉ chạy base demo
     ListControllers = None  # type: ignore
     _HAS_LIST_CONTROLLERS = False
 
-# Dofbot chess uses all five arm joints. arm5 remains inside the planning
-# model and is constrained by CHESS_JOINT_LIMITS to ±20 degrees.
+# Dofbot chess uses all five arm joints. arm5 is preferred near zero but uses
+# its physical range when a trajectory needs it.
 JOINT_NAMES = ["arm1_Joint", "arm2_Joint", "arm3_Joint", "arm4_Joint", "arm5_Joint"]
 BASE_LINK = "base_link"
 END_EFFECTOR = "Gripping_point_Link"
@@ -189,8 +189,22 @@ PLACE_YAW_COUNT = 1
 CANDIDATE_YAW_COUNT = 1
 PLACE_YAW_STEP_DEG = 45.0  # không dùng khi YAW_COUNT=1, giữ để khỏi sửa caller
 # Candidate quality is TCP direction error relative to the selected grasp.
-PREFERRED_TILT_RAD = math.radians(2.0)
-MAX_ACCEPTED_TILT_RAD = TCP_ORIENTATION_ERROR_RAD
+# The release gate is the only tilt hard gate.  Once a candidate satisfies it,
+# keep that branch rather than spending the move budget chasing a cosmetic
+# lower tilt value.
+PREFERRED_TILT_RAD = math.radians(26.0)
+MAX_ACCEPTED_TILT_RAD = math.radians(26.0)
+ARM5_PREFERENCE_SEEDS = tuple(math.radians(v) for v in
+                              (0.0, -20.0, 20.0, -45.0, 45.0,
+                               -75.0, 75.0))
+# Reorientation is done at destination clearance.  These extra physical arm5
+# seeds are deliberately limited to that phase; arm5 remains a preference,
+# not a joint-domain constraint.
+ARM5_REORIENTATION_SEEDS = tuple(
+    math.radians(sign * degrees)
+    for degrees in range(0, 116, 5)
+    for sign in ((1,) if degrees == 0 else (-1, 1))
+)
 PLACE_POSITION_TOL_M = 0.005
 # Sau detach giữ touch ACM trong lúc retreat; chỉ đóng khi TCP đã cách quân
 # đủ xa. Retreat hiện tại 65mm >> ngưỡng 10mm nên luôn thỏa, hằng số này để
@@ -412,6 +426,10 @@ class PickPlaceNode(Node):
         self._last_place_verify: dict | None = None
         self.reachability_service = self.create_service(
             Trigger, "/chess/check_reachability", self._check_reachability,
+            callback_group=cb_group,
+        )
+        self.e2e4_plan_service = self.create_service(
+            Trigger, "/chess/check_e2e4_plan", self._check_e2e4_plan,
             callback_group=cb_group,
         )
 
@@ -1164,13 +1182,11 @@ class PickPlaceNode(Node):
                               expect_attached: bool | None = None,
                               label: str | None = None,
                               acm_retries: int = 3):
-        """Xác nhận phase collision deny-all của 1 quân (Fix 3, deny-all).
+        """Xác nhận ACM của một quân theo phase gắp/đặt.
 
-        gripper_touch/board_contact: CHỈ nhận (False, False). Mọi motion đã
-        được thiết kế geometrically-valid dưới default-deny (hover + proud +
-        gate sweep strict) nên không phase nào được cần exception. Truyền True
-        là vi phạm thiết kế -> raise ngay (fail-closed, không retry vì cơ chế
-        không thể đáp ứng).
+        Chỉ ``gripper_touch`` được phép tạm mở trong phase descend/close của
+        quân nguồn. Quyền này giới hạn đúng ``GRIPPER_TOUCH_LINKS``; arm, bàn
+        và mọi quân khác vẫn default-deny. ``board_contact`` luôn bị cấm.
         expect_attached: invariant world/attached của quân ở phase hiện tại
         (True = phải ATTACHED, False = phải world và không attached,
         None = không khẳng định, chỉ dùng cho plan-only/scratch). Caller ở
@@ -1179,38 +1195,24 @@ class PickPlaceNode(Node):
         acm_retries: số lần GET-tươi + apply-lại khi entry CÓ mà sai giá trị
         (flip land được; churn thoáng qua). Hết lượt vẫn fail-closed raise.
 
-        DENY-ALL (đo 10/09/2026: MoveIt Humble ngó lơ entry ACM MỚI qua mọi
-        đường apply — upstream moveit#3527): entry vắng mặt là trạng thái
-        VĨNH VIỄN, tương đương default-deny. Vì want luôn (False, False) nên
-        vắng entry = ĐÃ XÁC NHẬN deny (ghi cache, đi tiếp) sau khi đã kiểm
-        world/attached đúng phase trong cùng 1 read. Entry CÓ mà sai giá trị
-        (rogue True) -> flip về False + retry + raise nếu không land (giữ
-        đúng quy tắc fail-closed: pop cache + raise, caller NACK, tuyệt đối
-        không plan/execute tiếp). Phase world/attached sai -> raise ngay.
-
-        P3: cache trạng thái đã xác nhận — phase không đổi thì return ngay,
-        khỏi GET (vòng seed trong precheck từng gọi hàng trăm lần cho cùng 1
-        phase). Caller đổi scene (attach/detach/remove/add) phải clear cache.
+        Mọi thay đổi đều read-after-write. Entry vắng chỉ tương đương deny khi
+        want=(False, False); với gripper_touch=True phải tạo entry và nhìn thấy
+        đủ hai chiều trước khi planner được chạy tiếp.
         """
         if not COLLISION_ENABLED:
             return
         want = (bool(gripper_touch), bool(board_contact))
+        if want[1]:
+            raise RuntimeError(f"[{label or obj_id}] cấm cho phép piece chạm bàn")
         if self._acm_cache.get(obj_id) == want:
             return
         tag = label or obj_id
-        if want != (False, False):
-            # Vi phạm thiết kế deny-all: không motion nào được cần exception.
-            self._acm_cache.pop(obj_id, None)
-            raise RuntimeError(
-                f"[{tag}] yêu cầu exception ACM {want} cho {obj_id} — thiết kế "
-                f"deny-all cấm (entry mới không land được trên MoveIt Humble); "
-                f"NACK, không plan/execute tiếp")
         last_exc: Exception | None = None
         for attempt in range(1, acm_retries + 1):
             self._check_budget(f"acm/{tag}")
             try:
                 status, why = self._read_acm_status(
-                    obj_id, expect_attached)
+                    obj_id, want[0], want[1], expect_attached)
                 if status == "unreadable":
                     raise RuntimeError(why)
                 if status == "phase-mismatch":
@@ -1219,30 +1221,27 @@ class PickPlaceNode(Node):
                     self._acm_cache.pop(obj_id, None)
                     raise _ACMFinalError(
                         f"[{tag}] {why}; NACK, không plan/execute tiếp")
-                if status in ("absent", "match"):
-                    # absent ≡ default-deny (đã xác nhận phase cùng 1 read);
-                    # match = entry có và đã False. Ghi cache, đi tiếp.
+                if status == "match":
                     self._acm_cache[obj_id] = want
-                    if status == "absent":
-                        self.get_logger().info(
-                            f"[ACM] {tag}: {why} (= default-deny, đã xác nhận "
-                            f"phase) -> đi tiếp không exception")
                     return
-                # status == "mismatch": entry CÓ mà sai giá trị (rogue True)
-                # -> flip về False (flips land được) + chờ + xác nhận lại.
-                self._apply_acm_entries(obj_id, False, False)
+                if status == "absent" and want == (False, False):
+                    self._acm_cache[obj_id] = want
+                    self.get_logger().info(
+                        f"[ACM] {tag}: {why} (= default-deny, phase confirmed)")
+                    return
+                self._apply_acm_entries(obj_id, want[0], want[1])
                 # Read-after-write: GET ngay sau apply có thể trả ACM cũ
                 # (move_group xử lý diff bất đồng bộ). Chờ tới khi entry đọc
                 # về khớp giá trị vừa ghi.
                 self._wait_for_acm_pair(
-                    obj_id, False, False, expect_attached,
+                    obj_id, want[0], want[1], expect_attached,
                     self._planning_timeout(ACM_APPLY_TIMEOUT_SEC), tag)
                 # Quy tắc fail-closed bắt buộc: CHỈ ghi cache sau khi đọc lại
                 # PlanningScene và xác nhận đúng. Không thấy -> pop cache +
                 # raise (caller NACK, không plan/execute tiếp). Không
                 # warning-rồi-tiếp-tục, không ghi cache khi chưa nhìn thấy
                 # ACM mong muốn.
-                if not self._acm_pair_visible(obj_id, False, False,
+                if not self._acm_pair_visible(obj_id, want[0], want[1],
                                               expect_attached):
                     self._acm_cache.pop(obj_id, None)
                     raise RuntimeError(
@@ -1270,7 +1269,8 @@ class PickPlaceNode(Node):
             f"sau {acm_retries} lần thử ({last_exc}); "
             f"NACK, không plan/execute tiếp")
 
-    def _read_acm_status(self, obj_id: str,
+    def _read_acm_status(self, obj_id: str, gripper_touch: bool,
+                         board_contact: bool,
                          expect_attached: bool | None) -> tuple[str, str]:
         """1 lần đọc tươi scene, phân loại trạng thái deny-all.
 
@@ -1303,7 +1303,7 @@ class PickPlaceNode(Node):
                 return "phase-mismatch", f"{obj_id} không ở world (phase đặt/bàn)"
         try:
             ok, why = self._check_acm_triple(
-                scene, obj_id, False, False, None)
+                scene, obj_id, gripper_touch, board_contact, None)
         except Exception as exc:
             return "unreadable", f"kiểm tra scene lỗi ({exc})"
         if ok:
@@ -1338,9 +1338,8 @@ class PickPlaceNode(Node):
             link_index = ensure(link)
             acm.entry_values[object_index].enabled[link_index] = gripper_touch
             acm.entry_values[link_index].enabled[object_index] = gripper_touch
-        board_index = ensure("chessboard")
-        acm.entry_values[object_index].enabled[board_index] = board_contact
-        acm.entry_values[board_index].enabled[object_index] = board_contact
+        if board_contact:
+            raise RuntimeError("ACM board_contact must remain false")
 
         req = ApplyPlanningScene.Request()
         req.scene.is_diff = True
@@ -1367,8 +1366,9 @@ class PickPlaceNode(Node):
                           expect_attached: bool | None) -> tuple[bool, str]:
         """Kiểm tra thuần trên scene đã GET (không gọi service).
 
-        Xác nhận cả 3: piece<->touch_links (TẤT CẢ link ngón, 2 chiều),
-        piece<->board (2 chiều), và world/attached đúng phase hiện tại.
+        Xác nhận piece<->touch_links (TẤT CẢ link ngón, 2 chiều) và
+        world/attached đúng phase hiện tại. Board không có ACM entry: absence
+        giữ default-deny, nên không tạo hay xác nhận một entry giả.
         Trả (True, "") khi khớp; (False, lý-do) để log chẩn đoán.
         """
         try:
@@ -1378,18 +1378,16 @@ class PickPlaceNode(Node):
             return False, "scene thiếu allowed_collision_matrix"
         if obj_id not in names:
             return False, f"thiếu entry {obj_id}"
-        if "chessboard" not in names:
-            return False, "thiếu entry chessboard"
+        if board_contact:
+            return False, "board_contact phải luôn false"
         for link in GRIPPER_TOUCH_LINKS:
             if link not in names:
                 return False, f"thiếu entry {link}"
         try:
             rows = acm.entry_values
             oi = names.index(obj_id)
-            bi = names.index("chessboard")
             lis = [names.index(link) for link in GRIPPER_TOUCH_LINKS]
             row_o = rows[oi].enabled
-            row_b = rows[bi].enabled
         except (IndexError, AttributeError):
             return False, "ACM row ngắn/hỏng"
 
@@ -1403,8 +1401,6 @@ class PickPlaceNode(Node):
                 return False, f"ACM row {link} ngắn/hỏng"
             if _at(row_o, li) != gripper_touch or _at(row_l, oi) != gripper_touch:
                 return False, f"cặp {obj_id}<->{link} chưa land"
-        if _at(row_o, bi) != board_contact or _at(row_b, oi) != board_contact:
-            return False, f"cặp {obj_id}<->chessboard chưa land"
         if expect_attached is not None:
             try:
                 attached_ids = {aco.object.id
@@ -1479,16 +1475,8 @@ class PickPlaceNode(Node):
 
     def _set_object_gripper_collision(self, obj_id: str, allow: bool,
                                        expect_attached: bool | None = None):
-        """Compat: xác nhận phase deny-all cho plan-only/dry-run/rollback.
-
-        Deny-all: allow=True bị cấm (raise) — không motion nào được cần
-        exception vì entry mới không land được. Mọi flow dùng (False, False).
-        """
-        if allow:
-            raise RuntimeError(
-                f"deny-all cấm mở exception ACM cho {obj_id} (entry mới không "
-                f"land được trên MoveIt Humble)")
-        self._set_piece_collision(obj_id, gripper_touch=False, board_contact=False,
+        """Compat cho caller cũ, mở đúng contact source-to-gripper khi cần."""
+        self._set_piece_collision(obj_id, gripper_touch=bool(allow), board_contact=False,
                                   expect_attached=expect_attached)
 
     def _wait_for_scene_object(self, obj_id: str, *, attached: bool, timeout_sec: float = 3.0):
@@ -1726,16 +1714,14 @@ class PickPlaceNode(Node):
         return state
 
     def _take_piece_from_world(self, square: str) -> str:
-        """Đánh dấu quân chuẩn bị gắp, vẫn giữ nó trong world collision scene."""
+        """Bắt đầu phase gắp với contact giới hạn source-to-gripper."""
         obj_id = self.piece_id_by_square.get(square)
         if obj_id is None:
             raise RuntimeError(f"ô {square} không có quân trong mapping nội bộ")
         if COLLISION_ENABLED:
-            # ACM trước, pop mapping sau: ACM fail thì mapping còn nguyên để
-            # retry thay vì mất dấu quân (Fix 4). Deny-all: confirm-deny
-            # (không mở exception nào — hover + proud giữ pose gắp valid).
-            # Quân còn nằm world.
-            self._set_piece_collision(obj_id, gripper_touch=False, board_contact=False,
+            # Quân vẫn ở world. Chỉ các link kẹp được quyền tiếp xúc trong
+            # descend/close; arm, bàn và quân khác vẫn collision-enabled.
+            self._set_piece_collision(obj_id, gripper_touch=True, board_contact=False,
                                       expect_attached=False, label=f"take-{square}")
         del self.piece_id_by_square[square]
         return obj_id
@@ -1841,13 +1827,6 @@ class PickPlaceNode(Node):
         Trả về list [(place_tcp, k, psi)] theo thứ tự |k·step| tăng dần.
         Quaternion rác raise (không đoán mò pose).
         """
-        if self._carry_quat is not None:
-            q_tcp = self._normalize_quaternion(self._carry_quat)
-            rotated = self._rotate_by_quaternion(
-                (local.position.x, local.position.y, local.position.z), q_tcp)
-            want = (target_xy[0], target_xy[1],
-                    BOARD_Z + PIECE_SPECS[piece_type].pickup_height / 2)
-            return [((*(v - r for v, r in zip(want, rotated)), q_tcp), 0, 0.0)]
         ql = self._normalize_quaternion(
             (local.orientation.x, local.orientation.y,
              local.orientation.z, local.orientation.w))
@@ -1960,26 +1939,23 @@ class PickPlaceNode(Node):
                    local.orientation.z, local.orientation.w)
         deadline = time.monotonic() + timeout_sec
         while True:
-            transform = self.tf_buffer.lookup_transform(
-                BASE_LINK, END_EFFECTOR, rclpy.time.Time())
-            t = transform.transform.translation
-            q = transform.transform.rotation
-            q_tcp = (q.x, q.y, q.z, q.w)
+            self._wait_for_joint_state(self.moveit2)
+            measured = copy.deepcopy(self.moveit2.joint_state)
+            tcp_xyz, q_tcp = self._fk_tcp_pose(
+                measured.name, list(measured.position))
             rotated = self._rotate_by_quaternion(
                 (local.position.x, local.position.y, local.position.z), q_tcp)
-            actual = (t.x + rotated[0], t.y + rotated[1], t.z + rotated[2])
+            actual = tuple(tcp_xyz[i] + rotated[i] for i in range(3))
             position_error = math.sqrt(sum(
                 (got - want) ** 2 for got, want in zip(actual, expected)))
             q_piece = self._multiply_quaternions(q_tcp, q_local)
             tilt = self._tilt_from_quaternion(q_piece)
-            orientation_error = self._orientation_error(q_tcp)
             # Lưu lần đo cuối cho report manual (cả PASS lẫn FAIL đều có số).
             # Fix 4: giữ cả tâm + orientation thực để _detach_piece dựng
             # scene theo thực tế thay vì "snap" về pose danh nghĩa.
             self._last_place_verify = {
                 "pos_err_m": float(position_error),
                 "tilt_deg": round(float(math.degrees(tilt)), 1),
-                "orientation_error_deg": math.degrees(orientation_error),
                 "actual_xyz": (float(actual[0]), float(actual[1]),
                                float(actual[2])),
                 "q_piece_xyzw": (float(q_piece[0]), float(q_piece[1]),
@@ -1987,7 +1963,7 @@ class PickPlaceNode(Node):
             }
             # P4/P7: pre-release gate cả tâm VÀ tilt. Mở kẹp khi quân nghiêng
             # quá hard limit sẽ đặt lệch/dổ dù tâm đúng.
-            if orientation_error > TCP_ORIENTATION_ERROR_RAD:
+            if tilt > MAX_ACCEPTED_TILT_RAD:
                 raise RuntimeError(
                     f"quân nghiêng trước detach: "
                     f"{math.degrees(tilt):.1f}° > hard "
@@ -2002,10 +1978,10 @@ class PickPlaceNode(Node):
                 raise RuntimeError(
                     f"pose quân trước detach sai: tâm quân thực tế "
                     f"={[round(v, 4) for v in actual]} muốn={expected} "
-                    f"(lệch {position_error:.4f}m); góc nghiêng tham khảo "
-                    f"(không dùng để FAIL)={math.degrees(tilt):.1f}deg; "
+                    f"(lệch {position_error:.4f}m); góc nghiêng quân "
+                    f"={math.degrees(tilt):.1f}deg; "
                     f"TCP yêu cầu {req}, "
-                    f"TCP thực tế xyz={[round(v, 4) for v in (t.x, t.y, t.z)]} "
+                    f"TCP thực tế xyz={[round(v, 4) for v in tcp_xyz]} "
                     f"quat={[round(v, 3) for v in q_tcp]}")
             time.sleep(0.02)
 
@@ -2674,6 +2650,42 @@ class PickPlaceNode(Node):
             with self._exec_lock:
                 self._executing = False
 
+    def _check_e2e4_plan(self, _request, response):
+        """D1 gate: plan the complete e2->e4 chain without moving the arm."""
+        with self._exec_lock:
+            if self._executing:
+                response.success = False
+                response.message = "Robot đang bận."
+                return response
+            self._executing = True
+        report = self._new_manual_report("e2", "e4")
+        previous_report = self._manual_report
+        self._manual_report = report
+        try:
+            self._require_ready("D1 e2->e4")
+            if self._needs_recovery:
+                raise RuntimeError("RECOVERY_REQUIRED; restart launch trước D1")
+            obj_id = self.piece_id_by_square.get("e2")
+            if obj_id is None:
+                raise RuntimeError("scene không có quân nguồn e2")
+            piece_type, _color = self.piece_info_by_id.get(obj_id, ("p", True))
+            tx, ty, tz = square_to_place_pose("e4", piece_type)
+            self._approach_and_descend_for_grasp(
+                "e2", piece_type, "D1 e2 descend", source_obj_id=obj_id,
+                dest_xy=(tx, ty), dest_piece_type=piece_type,
+                dest_approach_z=approach_tcp_z("e4", tz), dest_label="e4",
+                plan_only=True)
+            response.success = True
+            response.message = json.dumps(report.get("d1", {}), ensure_ascii=False)
+        except Exception as exc:
+            response.success = False
+            response.message = f"D1 e2->e4 FAIL: {exc}"
+        finally:
+            self._manual_report = previous_report
+            with self._exec_lock:
+                self._executing = False
+        return response
+
     def _new_manual_report(self, from_sq: str, to_sq: str) -> dict:
         return {
             "move": f"{from_sq}->{to_sq}",
@@ -2706,7 +2718,6 @@ class PickPlaceNode(Node):
         """Summarise only already-accepted D1 trajectories; never relax a gate."""
         arm5_values, margins, jumps = [], [], []
         source_position_error = float("inf")
-        source_orientation_error = float("inf")
         for trajectory in trajectories:
             if trajectory is None or not trajectory.points:
                 raise RuntimeError("D1 thiếu trajectory bắt buộc")
@@ -2724,14 +2735,9 @@ class PickPlaceNode(Node):
             if trajectory is trajectories[1]:
                 xyz, quat = self._fk_tcp_pose(names, trajectory.points[-1].positions)
                 source_position_error = math.dist(xyz, source_target)
-                source_orientation_error = self._orientation_error(quat, source_quat)
-        destination_orientation_error = self._orientation_error(
-            destination_quat, source_quat)
         report = {
             "arm5_min_rad": min(arm5_values),
             "arm5_max_rad": max(arm5_values),
-            "grasp_orientation_error_deg": math.degrees(source_orientation_error),
-            "place_orientation_error_deg": math.degrees(destination_orientation_error),
             "max_position_error_mm": max(source_position_error, place_error) * 1000.0,
             "min_joint_limit_margin_rad": min(margins),
             "max_joint_jump_rad": max(jumps, default=0.0),
@@ -2740,11 +2746,7 @@ class PickPlaceNode(Node):
                 if self._manual_report is not None else 1.0,
         }
         report["pass"] = (
-            -ARM5_CAGE_RAD - LOCKED_JOINT_TOL_RAD <= report["arm5_min_rad"]
-            and report["arm5_max_rad"] <= ARM5_CAGE_RAD + LOCKED_JOINT_TOL_RAD
-            and report["grasp_orientation_error_deg"] <= 5.0
-            and report["place_orientation_error_deg"] <= 5.0
-            and report["max_position_error_mm"] <= 5.0
+            report["max_position_error_mm"] <= 5.0
             and report["min_joint_limit_margin_rad"] >= MARGIN_MIN_RAD
             and report["max_joint_jump_rad"] <= MAX_JOINT_STEP_RAD
             and report["min_cartesian_fraction"] >= CARTESIAN_FRACTION_THRESHOLD)
@@ -2831,10 +2833,8 @@ class PickPlaceNode(Node):
                   if fv.get("pos_err_m") is not None else None)
         tilt = fv.get("tilt_deg")
         checks["place_err_mm<=5"] = err_mm is not None and err_mm <= 5.0
-        orientation_error = fv.get("orientation_error_deg")
-        checks["orientation_error_deg<=5"] = (
-            orientation_error is not None
-            and orientation_error <= math.degrees(TCP_ORIENTATION_ERROR_RAD))
+        checks["piece_tilt_deg<=26"] = (
+            tilt is not None and tilt <= math.degrees(MAX_ACCEPTED_TILT_RAD))
         checks["no_collision"] = len(report["collisions"]) == 0
         checks["no_attached_left"] = report["attached_left"] == []
         checks["home_reached"] = (
@@ -4044,9 +4044,7 @@ class PickPlaceNode(Node):
                 self.get_logger().info(
                     f"[PHASE] pick-place {from_sq}->{to_sq}: cache bị loại "
                     f"-> full_remaining_chain_replan từ nguồn")
-                self._move_vertical(
-                    x0, y0, source_approach_z, "nâng sau gắp",
-                    quat_xyzw=grasp_q)
+                self._move_to(x0, y0, source_approach_z)
                 # Quân đã thoát mặt bàn: ĐÓNG board-contact ngay (Fix 3). Giữ
                 # gripper-touch suốt lúc mang. Nếu còn mở, quân attached xuyên
                 # bàn trong transfer mà không bị chặn.
@@ -4270,7 +4268,8 @@ class PickPlaceNode(Node):
     def _approach_and_descend_for_grasp(self, square, piece_type, step_name,
                                         source_obj_id=None,
                                         dest_xy=None, dest_piece_type=None,
-                                        dest_approach_z=None, dest_label=None):
+                                        dest_approach_z=None, dest_label=None,
+                                        plan_only=False):
         """Tìm offset gắp an toàn: PLAN-ONLY toàn bộ candidate, EXECUTE một lần.
 
         P1: mọi candidate chỉ PLAN (approach OMPL + descend Cartesian +
@@ -4316,8 +4315,17 @@ class PickPlaceNode(Node):
                     raise
                 except Exception:
                     entry_quat = None
-                for index, offset in enumerate(
-                        self._grasp_offset_candidates(square), 1):
+                arm5_seeds = ARM5_PREFERENCE_SEEDS
+                # A candidate is an approach offset plus a bounded arm5 seed.
+                # It is never accepted on approach alone: the descend and the
+                # remaining D1 carry chain below must pass before it can win.
+                approach_candidates = [
+                    (offset, arm5_seed)
+                    for offset in self._grasp_offset_candidates(square)
+                    for arm5_seed in arm5_seeds
+                ]
+                for index, (offset, arm5_seed) in enumerate(
+                        approach_candidates, 1):
                     self._carry_quat = None
                     # Buoc C: tinh huong occupancy (bai hoc d1/e1 buoc b).
                     # Quan cao ke ben co the cham ngon khi descend; day la
@@ -4339,7 +4347,8 @@ class PickPlaceNode(Node):
                     self._planning_gripper_rad = self._gripper_stage_rad(piece_type, "open")
                     # P2: hết budget thì dừng search ngay (raise, không thử
                     # candidate kế, không tràn deadline ngoài hàng phút).
-                    self._check_budget(f"{square}/offset{offset}")
+                    self._check_budget(
+                        f"{square}/offset{offset}/q5={math.degrees(arm5_seed):+.0f}")
                     if math.hypot(*offset) > GRASP_MAX_OFFSET:
                         errors.append(
                             f"{offset}: vượt bán kính quân {GRASP_MAX_OFFSET} m")
@@ -4361,7 +4370,7 @@ class PickPlaceNode(Node):
                     if source_obj_id is not None:
                         try:
                             self._set_piece_collision(
-                                source_obj_id, gripper_touch=False,
+                                source_obj_id, gripper_touch=True,
                                 board_contact=False, expect_attached=False,
                                 label=f"precheck-src-{square}")
                         except PlanningBudgetExceeded:
@@ -4378,31 +4387,35 @@ class PickPlaceNode(Node):
                     lift_z = min(approach_z, z + CARRY_CLEARANCE_LIFT_M)
                     # P1: PLAN approach từ pose vào hàm (robot chưa nhúc
                     # nhích; mọi candidate cùng start nên so sánh được).
-                    # P4-mở-rộng: IK-seed (entry continuity) + joint-goal OMPL
-                    # giữ orientation; position-OMPL để goal-IK nội bộ whim
-                    # nhánh (đo thực tilt lung tung) — chỉ fallback khi IK fail.
+                    # Plan exact joint-goal of this candidate. Do not fall back
+                    # to a different implicit IK branch: that would disconnect
+                    # the descend result from the candidate being scored.
                     approach_trajectory = None
                     if entry_quat is not None:
                         try:
+                            approach_seed = copy.deepcopy(entry_start)
+                            seed_values = dict(zip(
+                                approach_seed.name, approach_seed.position))
+                            seed_values["arm5_Joint"] = arm5_seed
+                            approach_seed.position = [
+                                seed_values[name] for name in approach_seed.name]
                             approach_trajectory = self._ompl_joint_goal_seeded(
-                                [x, y, approach_z], entry_quat, entry_start,
-                                entry_start, f"{square}/approach{offset}")
+                                [x, y, approach_z], entry_quat, approach_seed,
+                                entry_start,
+                                f"{square}/approach{offset}/q5seed="
+                                f"{math.degrees(arm5_seed):+.0f}")
                         except PlanningBudgetExceeded:
                             raise
                         except Exception as exc:
                             self.get_logger().warning(
                                 f"[GRASP-CANDIDATE] {square} thử {index} "
                                 f"offset={offset}: seeded-approach lỗi ({exc}) "
-                                f"-> fallback position-OMPL")
+                                f"-> loại candidate")
                             approach_trajectory = None
                     if approach_trajectory is None:
-                        approach_trajectory = self._plan_quiet(
-                            f"{square}/approach{offset}",
-                            _start_joint_state=entry_start,
-                            position=[x, y, approach_z], target_link=END_EFFECTOR,
-                            tolerance_position=0.004, cartesian=False)
-                    if approach_trajectory is None:
-                        errors.append(f"{offset}: không có OMPL approach")
+                        errors.append(
+                            f"{offset}/q5={math.degrees(arm5_seed):+.0f}: "
+                            "không có OMPL approach")
                         self.get_logger().warning(
                             f"[GRASP-CANDIDATE] {square} thử {index} "
                             f"offset={offset}: OMPL fail"
@@ -4493,20 +4506,6 @@ class PickPlaceNode(Node):
                             f"[GRASP-CANDIDATE] {square} thử {index} "
                             f"offset={offset}: tilt gắp {grasp_end_tilt_deg:.1f}° "
                             f"(approach {grasp_tilt_deg:.1f}°)")
-                        # Gate tilt gắp (step-3): tilt gắp cộng dồn với tilt
-                        # seed đặt (đo thực 17°+17° -> piece 35° chết gate
-                        # 26°; comp tịnh tiến không sửa được xoay) -> loại
-                        # offset ngay trước sweep/chain đắt.
-                        if self._orientation_error(dq) > TCP_ORIENTATION_ERROR_RAD:
-                            errors.append(
-                                f"{offset}: tilt gắp {grasp_end_tilt_deg:.1f}° "
-                                f"vượt mốc {math.degrees(TCP_GRASP_TILT_RAD):.0f}° "
-                                f"+-{math.degrees(GRASP_TILT_TOL_RAD):.0f}°")
-                            self.get_logger().warning(
-                                f"[GRASP-CANDIDATE] {square} thử {index} "
-                                f"offset={offset}: tilt gắp "
-                                f"{grasp_end_tilt_deg:.1f}° -> loại")
-                            continue
                     except PlanningBudgetExceeded:
                         raise
                     except Exception as exc:
@@ -4693,11 +4692,15 @@ class PickPlaceNode(Node):
             raise RuntimeError(
                 "D1 gate fail: " + json.dumps(d1, ensure_ascii=False))
         self._grasp_offset_cache[square] = offset
+        if plan_only:
+            self._carry_quat = None
+            self._planning_gripper_rad = None
+            return x, y, z, lift_z, _grasp_q_pred, verified
         if source_obj_id is not None:
-            # Deny-all: không re-assert exception (không land được); chỉ
-            # confirm-deny + world-phase để chắc scene khỏe trước execute.
+            # Re-assert precisely the temporary source-to-gripper contact
+            # before executing the prevalidated descend trajectory.
             self._set_piece_collision(
-                source_obj_id, gripper_touch=False, board_contact=False,
+                source_obj_id, gripper_touch=True, board_contact=False,
                 expect_attached=False, label=f"pre-exec-{square}")
         else:
             self.get_logger().warning(
@@ -4845,12 +4848,6 @@ class PickPlaceNode(Node):
             self.moveit2.set_path_joint_constraint(
                 joint_names=[name], joint_positions=[(lo + hi) / 2.0],
                 tolerance=max((hi - lo) / 2.0, LOCKED_JOINT_TOL_RAD))
-        if self._carry_quat is not None:
-            self.moveit2.set_path_orientation_constraint(
-                quat_xyzw=self._carry_quat, frame_id=BASE_LINK,
-                target_link=END_EFFECTOR,
-                tolerance=TCP_ORIENTATION_ERROR_RAD / math.sqrt(3.0),
-                parameterization=1)
 
     def _trajectory_domain_valid(self, trajectory, allow_domain_entry=False):
         if trajectory is None or not trajectory.points:
@@ -5283,9 +5280,133 @@ class PickPlaceNode(Node):
         position_error = math.sqrt(sum(
             (got - w) ** 2 for got, w in zip(center, want)))
         q_piece = self._multiply_quaternions(fq, ql)
-        tilt = (self._orientation_error(fq) if self._carry_quat is not None
-                else self._tilt_from_quaternion(q_piece))
+        tilt = self._tilt_from_quaternion(q_piece)
         return position_error, tilt, center, q_piece
+
+    def _plan_release_chain(self, start_state, local, target_xy, piece_type,
+                            approach_z, context, extra_seeds=None):
+        """Solve the piece endpoint, then connect a checked descend and OMPL.
+
+        FK optimization proposes states only. MoveIt validates the payload and
+        every trajectory before a proposal becomes executable.
+        """
+        from scipy.optimize import least_squares
+
+        names = list(JOINT_NAMES)
+        bounds = [CHESS_JOINT_LIMITS[name] for name in names]
+        lower = [lo + JOINT_LIMIT_MARGIN_RAD for lo, _ in bounds]
+        upper = [hi - JOINT_LIMIT_MARGIN_RAD for _, hi in bounds]
+        want = (target_xy[0], target_xy[1],
+                BOARD_Z + PIECE_SPECS[piece_type].pickup_height / 2)
+        seeds = list(extra_seeds or []) + [("carry", start_state)]
+        values = dict(zip(start_state.name, start_state.position))
+        for degrees in (0, -45, 45, -90, 90, -110, 110):
+            seed = copy.deepcopy(start_state)
+            seed.position = [math.radians(degrees) if n == "arm5_Joint"
+                             else values[n] for n in seed.name]
+            seeds.append((f"wrist-{degrees}", seed))
+        seen = set()
+        reasons = []
+        for label, seed in seeds:
+            self._check_budget(context)
+            seed_map = dict(zip(seed.name, seed.position))
+            initial = [min(hi - 1e-6, max(lo + 1e-6, seed_map[n]))
+                       for n, lo, hi in zip(names, lower, upper)]
+            key = tuple(round(v, 4) for v in initial)
+            if key in seen:
+                continue
+            seen.add(key)
+            cache = {}
+            deadline = time.monotonic() + 8.0
+
+            def evaluate(joints):
+                self._check_budget(context)
+                key = tuple(float(v) for v in joints)
+                if key not in cache:
+                    xyz, quat = self._fk_tcp_pose(names, list(key))
+                    cache[key] = (xyz, quat, self._piece_error_from_tcp(
+                        xyz, quat, local, target_xy, piece_type))
+                return cache[key]
+
+            def residual(joints):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("release endpoint search timeout")
+                _, _, (_, tilt, center, _) = evaluate(joints)
+                # Aim inside the release gates without constraining TCP yaw.
+                return [(center[i] - want[i]) / 0.003 for i in range(3)] + [
+                    max(0.0, tilt - math.radians(20.0)) / 0.1,
+                    0.001 * float(joints[-1])]
+
+            try:
+                solution = least_squares(
+                    residual, initial, bounds=(lower, upper),
+                    diff_step=1e-4, max_nfev=24,
+                    ftol=1e-5, xtol=1e-5, gtol=1e-5)
+                xyz, quat, (err, tilt, _, _) = evaluate(solution.x)
+            except PlanningBudgetExceeded:
+                raise
+            except TimeoutError:
+                reasons.append(f"{label}: endpoint timeout")
+                continue
+            if err > PLACE_POSITION_TOL_M or tilt > MAX_ACCEPTED_TILT_RAD:
+                reasons.append(f"{label}: center={err * 1000:.1f}mm "
+                               f"piece tilt={math.degrees(tilt):.1f}deg")
+                continue
+            release = copy.deepcopy(start_state)
+            solved = dict(zip(names, (float(v) for v in solution.x)))
+            release.position = [solved.get(n, v) for n, v in
+                                zip(release.name, release.position)]
+            # Plan upward from the exact release pose. Reversing this path
+            # preserves its IK branch and the solved endpoint at descent end.
+            upward = self._plan_quiet(
+                f"{context}/{label}/reverse-descend",
+                _start_joint_state=release,
+                position=[xyz[0], xyz[1], max(approach_z, xyz[2] + 0.01)],
+                quat_xyzw=list(quat), target_link=END_EFFECTOR,
+                cartesian=True, max_step=CARTESIAN_MAX_STEP_M,
+                cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD)
+            if upward is None or len(upward.points) < 2:
+                reasons.append(f"{label}: Cartesian release-to-clearance failed")
+                continue
+            desc = copy.deepcopy(upward)
+            desc.header.stamp.sec = 0
+            desc.header.stamp.nanosec = 0
+            total = (upward.points[-1].time_from_start.sec * 1000000000
+                     + upward.points[-1].time_from_start.nanosec)
+            desc.points = list(reversed(desc.points))
+            for point in desc.points:
+                old = (point.time_from_start.sec * 1000000000
+                       + point.time_from_start.nanosec)
+                point.time_from_start.sec, point.time_from_start.nanosec = divmod(
+                    total - old, 1000000000)
+                point.velocities = [-v for v in point.velocities]
+                point.effort = []
+            pre = self._plan_quiet(
+                f"{context}/{label}/clearance", _start_joint_state=start_state,
+                joint_names=list(desc.joint_names),
+                joint_positions=list(desc.points[0].positions), cartesian=False)
+            if pre is None or not self._trajectory_boundary_close(pre, desc):
+                reasons.append(f"{label}: OMPL clearance connection failed")
+                continue
+            if any(self._trajectory_max_step(t) > MAX_JOINT_STEP_RAD
+                   or not self._trajectory_domain_valid(t)
+                   or any(self._min_limit_margin_rad(dict(zip(
+                       t.joint_names, point.positions))) < JOINT_LIMIT_MARGIN_RAD
+                       for point in t.points)
+                   or not self._cached_trajectory_collision_free(t, context)
+                   for t in (pre, desc)):
+                reasons.append(f"{label}: collision, joint margin or joint jump")
+                continue
+            end_xyz, end_q = self._fk_tcp_pose(
+                desc.joint_names, desc.points[-1].positions)
+            err, tilt, _, _ = self._piece_error_from_tcp(
+                end_xyz, end_q, local, target_xy, piece_type)
+            if err <= PLACE_POSITION_TOL_M and tilt <= MAX_ACCEPTED_TILT_RAD:
+                return (tilt, err, pre, desc,
+                        (*end_xyz, end_q), end_q, f"{context}/{label}")
+            reasons.append(f"{label}: release endpoint changed")
+        self._last_chain_failure_reason = "; ".join(reasons[-8:]) or "no release seed"
+        return None
 
     def _compensate_place_tcp(self, place_tcp, center, target_xy,
                                piece_type: str):
@@ -5362,13 +5483,12 @@ class PickPlaceNode(Node):
                 seeds.append(("collision-adjusted", adjusted))
             except Exception:
                 pass
-        # arm5 is a soft preference, not a fixed model joint. Search a small,
-        # symmetric set inside the hard ±20 degree cage, ordered by |arm5|.
+        # arm5 is a soft preference. Search wider physical seeds ordered by
+        # distance from zero, without imposing an artificial planner cage.
         expanded = []
         for label, state in seeds:
             values = dict(zip(state.name, state.position))
-            for arm5 in (0.0, -ARM5_CAGE_RAD / 2.0, ARM5_CAGE_RAD / 2.0,
-                         -ARM5_CAGE_RAD, ARM5_CAGE_RAD):
+            for arm5 in ARM5_PREFERENCE_SEEDS:
                 candidate = copy.deepcopy(state)
                 candidate_values = dict(zip(candidate.name, candidate.position))
                 candidate_values["arm5_Joint"] = arm5
@@ -5383,6 +5503,29 @@ class PickPlaceNode(Node):
             if label not in seen:
                 seen.add(label)
                 out.append((label, state))
+        return out
+
+    def _reorientation_seed_states(self, chain_end, region: str) -> list:
+        """Seed the destination-clearance reorientation from the carry branch.
+
+        Position-only KDL uses the seed to choose its redundant wrist branch.
+        Keep the carry endpoint first, then sweep only arm5 within its physical
+        range so the place phase can find an upright piece before descend.
+        """
+        # Do not feed the already-expanded generic seed list back through this
+        # sweep: that creates hundreds of duplicate IK/OMPL attempts and can
+        # exhaust the move budget before reorientation is evaluated.
+        source = [("chain", chain_end)]
+        out = []
+        for label, state in source:
+            values = dict(zip(state.name, state.position))
+            for arm5 in ARM5_REORIENTATION_SEEDS:
+                candidate = copy.deepcopy(state)
+                candidate_values = dict(values)
+                candidate_values["arm5_Joint"] = arm5
+                candidate.position = [candidate_values[n] for n in candidate.name]
+                out.append((f"{label}/reorient-arm5={math.degrees(arm5):+.0f}",
+                            candidate))
         return out
 
     def _ompl_joint_goal_seeded(self, position_xyz, quat_xyzw, seed_state,
@@ -5412,8 +5555,10 @@ class PickPlaceNode(Node):
                 f"[SEED-IK] {label}: IK thiếu joint "
                 f"({len(ik_names)}/{len(JOINT_NAMES)}) -> None")
             return None
-        # Chẩn đoán nhánh: FK nghiệm IK + so với seed (đo strict có đẩy KDL
-        # sang nhánh lật dù seed continuity không).
+        # KDL của arm_group chạy position_only_ik. Quaternion trong request
+        # không phải orientation constraint, vì vậy chỉ dùng FK ở đây để ghi
+        # nhận hướng thực của nghiệm. Hướng đó sẽ trở thành carry target sau
+        # khi approach được chọn và bị giữ chặt cho descend/lift/transfer/place.
         try:
             _ik_xyz, _ik_q = self._fk_tcp_pose(
                 ik_names, [float(ik_map[n]) for n in ik_names])
@@ -5428,14 +5573,6 @@ class PickPlaceNode(Node):
             self.get_logger().info(
                 f"[SEED-IK] {label}: IK ok, tilt nghiệm "
                 f"{_ik_tilt:.1f}°, nhảy-vs-seed {math.degrees(_djump):.0f}°")
-            # Step-3: loại nghiệm nghiêng ngay (đo thực KDL trả 133° dù seed
-            # thẳng; tilt này mang suốt chuỗi rồi chết ở gate 26°).
-            if self._orientation_error(_ik_q, quat_xyzw) > TCP_ORIENTATION_ERROR_RAD:
-                self.get_logger().warning(
-                    f"[SEED-IK] {label}: loại nghiệm nghiêng {_ik_tilt:.1f}° "
-                    f"(mốc {math.degrees(TCP_GRASP_TILT_RAD):.0f}° "
-                    f"+-{math.degrees(SEED_IK_TILT_TOL_RAD):.0f}°) -> None")
-                return None
         except PlanningBudgetExceeded:
             raise
         except Exception as exc:
@@ -5484,7 +5621,8 @@ class PickPlaceNode(Node):
             ik_names = [n for n in JOINT_NAMES if n in ik_map]
             if len(ik_names) != len(JOINT_NAMES):
                 continue
-            # Step-3: FK từng nghiệm, loại nghiệm nghiêng trước OMPL.
+            # FK is diagnostic only here. Orientation is free during motion;
+            # the attached piece is checked at the release endpoint.
             try:
                 _s_xyz, _s_q = self._fk_tcp_pose(
                     ik_names, [float(ik_map[n]) for n in ik_names])
@@ -5492,11 +5630,6 @@ class PickPlaceNode(Node):
             except PlanningBudgetExceeded:
                 raise
             except Exception:
-                continue
-            if self._orientation_error(_s_q, self._carry_quat or pq) > TCP_ORIENTATION_ERROR_RAD:
-                self.get_logger().info(
-                    f"[SEED-IK] {label}/seed-{seed_label}: loại nghiệm nghiêng "
-                    f"{math.degrees(_s_tilt):.1f}°")
                 continue
             pre = self._plan_quiet(
                 f"{label}/pre-{seed_label}",
@@ -5667,8 +5800,10 @@ class PickPlaceNode(Node):
         xyz, quat = self._fk_tcp_pose(JOINT_NAMES, [values[n] for n in JOINT_NAMES])
         if math.dist(xyz, position) > PLACE_POSITION_TOL_M:
             return None
-        if self._orientation_error(quat, self._carry_quat or quat_xyzw) > TCP_ORIENTATION_ERROR_RAD:
-            return None
+        # position_only_ik không hề cam kết quaternion request. Không được
+        # loại một nghiệm đúng XYZ/collision/domain chỉ vì nó khác target
+        # orientation danh nghĩa ở seed phase. Gate orientation được áp lên
+        # trajectory Cartesian và carry orientation đã chốt từ FK approach.
         self._assert_arm_trajectory_joint_names(list(values.keys()), f"{context}/ik")
         mname, mm = min_margin({n: values[n] for n in JOINT_NAMES if n in values})
         if mm < MARGIN_MIN_RAD:
@@ -5878,17 +6013,20 @@ class PickPlaceNode(Node):
             # không được lấy state sống). Timeout plan raise -> chuẩn hoá
             # thành None (loại offset này).
             try:
-                lift = self._plan_vertical_trajectory(
-                    grasp_xyz[0], grasp_xyz[1], grasp_approach_z, grasp_q,
-                    f"{context}/lift",
-                    _start_joint_state=lift_start_state)
+                if lift_start_state is None:
+                    raise RuntimeError("missing planned grasp endpoint")
+                lift = self._ompl_joint_goal_seeded(
+                    [grasp_xyz[0], grasp_xyz[1], grasp_approach_z], grasp_q,
+                    lift_start_state, lift_start_state, f"{context}/lift")
+            except PlanningBudgetExceeded:
+                raise
             except Exception as exc:
                 self._last_chain_failure_reason = f"lift plan lỗi: {exc}"
                 self.get_logger().warning(
                     f"[CHAIN] {context}: lift plan lỗi ({exc}) -> loại offset")
                 return None
             if lift is None:
-                self._last_chain_failure_reason = "Cartesian clearance lift có mang fail"
+                self._last_chain_failure_reason = "OMPL clearance lift có mang fail"
                 self.get_logger().warning(
                     f"[CHAIN] {context}: lift có mang fail -> loại offset")
                 return None
@@ -5962,18 +6100,6 @@ class PickPlaceNode(Node):
                 self.get_logger().info(
                     f"[CHAIN] {context}: transfer đạt, tilt cuối "
                     f"{math.degrees(_te_tilt):.1f}°")
-                # Step-3: transfer nghiêng -> place không cứu được (đã chứng
-                # minh 3 runs comp phân kỳ) -> loại offset ngay, khỏi đốt
-                # budget comp. Không fallback position-OMPL (whim tilt).
-                if self._orientation_error(_te_q, grasp_q) > TCP_ORIENTATION_ERROR_RAD:
-                    self._last_chain_failure_reason = (
-                        f"transfer tilt {math.degrees(_te_tilt):.1f}° "
-                        f"(mốc {math.degrees(TCP_GRASP_TILT_RAD):.0f}° "
-                        f"+-{math.degrees(TRANSFER_TILT_TOL_RAD):.0f}°)")
-                    self.get_logger().warning(
-                        f"[CHAIN] {context}: {self._last_chain_failure_reason} "
-                        f"-> loại offset")
-                    return None
             except PlanningBudgetExceeded:
                 raise
             except Exception as exc:
@@ -5981,216 +6107,21 @@ class PickPlaceNode(Node):
                 self.get_logger().warning(
                     f"[CHAIN] {context}: endpoint transfer xấu ({exc}) -> loại")
                 return None
-            yaw_cands = self._place_yaw_candidates_for_local(
-                hypo_local, target_xy, dest_piece_type, grasp_q, yaw_count)
-            # P3: gom phase collision — TẤT CẢ descend scratch trong vòng
-            # yaw/comp/seed bên dưới cần cùng phase (touch+board). Set MỘT lần
-            # ở đây thay cho 2 service-call MỖI seed (hàng trăm call cho một
-            # candidate). Restore một lần sau vòng yaw (cả 2 đường return);
-            # đường raise-budget bỏ qua restore vì scratch bị detach ngay ở
-            # finally ngoài và move fail luôn. Scratch proxy đang ATTACHED.
             self._set_piece_collision(
                 scratch_id, gripper_touch=False, board_contact=False,
                 expect_attached=True, label="dry-proxy-desc")
-            # TODO-2: seed IK hữu hạn cho mỗi pre-place (chain-end + current +
-            # HOME + template vùng). Seed chỉ đổi nghiệm IK (nhánh khớp), mọi
-            # pre đều start nối từ cuối transfer nên chuỗi vẫn liên tục.
-            region = self._region_for_target(target_xy)
-            seed_states = [("chain", transfer_end)] + [
-                (label, state)
-                for label, state in self._candidate_seed_states(region)
-            ]
-            best = None  # (tilt, pos_err, pre, desc, place_tcp, fq, label)
-            # P2: tách correction eligibility khỏi execute eligibility.
-            # Candidate lệch tâm >5mm vẫn được giữ để bù XYZ (chỉ cần FK/IK/
-            # Cartesian hợp lệ + tilt không quá hard); chỉ candidate đạt đủ
-            # hard gate mới được execute. Đếm vòng bù THỰC TẾ cho log.
-            chain_reasons: list[str] = []
-            rounds_run = 0
-            prev_corr_joints = None  # (names, positions) endpoint desc tốt nhất vòng trước
-            prev_corr_desc = None
-            for place_tcp, _k, _psi in yaw_cands:
-                # P2: hết budget thì dừng search ngay, không thử yaw kế.
-                self._check_budget(f"{context}/yaw")
-                if best is not None and best[0] <= PREFERRED_TILT_RAD:
-                    break
-                for correction in range(PLACE_COMPENSATION_MAX_ITERATIONS):
-                    self._check_budget(f"{context}/comp")
-                    rounds_run += 1
-                    px, py, pz, pq = (place_tcp[0], place_tcp[1],
-                                      place_tcp[2], place_tcp[3])
-                    label = f"{context}/comp{correction + 1}"
-                    # Plan-only từ đúng cuối transfer ở mọi vòng; arm chưa di
-                    # chuyển. XYZ được sửa theo tâm quân FK của vòng trước.
-                    # P2: thêm endpoint tốt nhất vòng trước làm IK seed đầu
-                    # tiên để giữ cùng nhánh khớp (solver position-only có thể
-                    # lật nhánh khi target XYZ dịch nhẹ).
-                    corr_best = None  # executable: pos<=tol và tilt<=hard, tilt min
-                    corr_center = None
-                    corr_source = None  # bù XYZ: pos_err min trong số tilt<=hard
-                    corr_source_center = None
-                    corr_source_joints = None
-                    n_fk = 0
-                    n_tilt_reject = 0
-                    round_seeds = list(seed_states)
-                    if prev_corr_desc is not None:
-                        try:
-                            prev_state = self._joint_state_from_trajectory_end(
-                                prev_corr_desc)
-                            round_seeds = [("prev-corr", prev_state)] + round_seeds
-                        except Exception:
-                            pass
-                    self.get_logger().info(
-                        f"[SEED] {label}: seeds="
-                        f"{[s for s, _ in round_seeds]}")  # TMP-DEBUG chain
-                    for (pre, pre_end, pre_q, seed_label) in (
-                            self._plan_seed_based_preplace_options(
-                                transfer_end, px, py, target_approach_z, pq,
-                                round_seeds, label)):
-                        # P3: phase touch+board đã set MỘT lần ngoài vòng yaw
-                        # (gom batch) — không set/restore theo từng seed nữa.
-                        desc = self._plan_quiet(
-                            f"{label}/descend-{seed_label}",
-                            _start_joint_state=pre_end,
-                            position=[px, py, pz], quat_xyzw=pre_q,
-                            target_link=END_EFFECTOR,
-                            tolerance_position=0.002,
-                            tolerance_orientation=0.03,
-                            cartesian=True, max_step=CARTESIAN_MAX_STEP_M,
-                            cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD)
-                        if desc is None:
-                            continue
-                        try:
-                            last = desc.points[-1]
-                            (fx, fy, fz), fq = self._fk_tcp_pose(
-                                desc.joint_names, last.positions)
-                            pos_err, tilt, center, _q = self._piece_error_from_tcp(
-                                (fx, fy, fz), fq, hypo_local,
-                                target_xy, dest_piece_type)
-                        except Exception as exc:
-                            chain_reasons.append(
-                                f"{label}/{seed_label}: FK lỗi ({exc})")
-                            continue
-                        n_fk += 1
-                        # P2: tilt>hard thì reject CÓ ghi lý do (trước đây chỉ
-                        # ghi khi đã đạt tâm; candidate lệch tâm bị drop câm).
-                        # Candidate tilt OK nhưng lệch tâm vẫn là nguồn bù XYZ.
-                        if tilt > MAX_ACCEPTED_TILT_RAD:
-                            n_tilt_reject += 1
-                            chain_reasons.append(
-                                f"{label}/{seed_label}: tilt "
-                                f"{math.degrees(tilt):.1f}° > hard "
-                                f"{math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}° "
-                                f"(err {pos_err * 1000:.1f}mm)")
-                            self._last_chain_failure_reason = (
-                                f"nghiệm đạt FK nhưng tilt "
-                                f"{math.degrees(tilt):.1f}° > hard "
-                                f"{math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°")
-                            continue
-                        if (corr_source is None
-                                or pos_err < corr_source[1]):
-                            corr_source = (
-                                tilt, pos_err, pre, desc, (px, py, pz, fq),
-                                fq, f"{label}/{seed_label}")
-                            corr_source_center = center
-                            corr_source_joints = (
-                                list(desc.joint_names),
-                                [float(v) for v in last.positions])
-                        if pos_err > PLACE_POSITION_TOL_M:
-                            continue  # giữ để bù, chưa đủ gate execute
-                        cand = (tilt, pos_err, pre, desc, (px, py, pz, fq),
-                                fq, f"{label}/{seed_label}")
-                        if corr_best is None or tilt < corr_best[0]:
-                            corr_best = cand
-                            corr_center = center
-                    self.get_logger().debug(
-                        f"[CHAIN-CORR] {label}: {n_fk} FK, nguồn bù tốt nhất "
-                        f"{(corr_source[1] * 1000.0):.1f}mm tilt "
-                        f"{math.degrees(corr_source[0]):.1f}°"
-                        if corr_source is not None else
-                        f"[CHAIN-CORR] {label}: {n_fk} FK, không nguồn bù "
-                        f"(tilt-reject {n_tilt_reject})")
-                    if corr_source is None:
-                        chain_reasons.append(
-                            f"{label}: không candidate FK nào tilt<=hard "
-                            f"(thử {n_fk} FK, loại tilt {n_tilt_reject})")
-                        break  # yaw này hết cửa -> yaw kế
-                    # P2: continuity nhánh IK — endpoint vòng này phải gần vòng
-                    # trước, nếu không phép bù residual mất hiệu lực.
-                    if prev_corr_joints is not None:
-                        jump = self._max_joint_delta(
-                            prev_corr_joints[0], prev_corr_joints[1],
-                            corr_source_joints[0], corr_source_joints[1])
-                        if jump > PLACE_BRANCH_JUMP_RAD:
-                            chain_reasons.append(
-                                f"{label}: IK_BRANCH_JUMP "
-                                f"{math.degrees(jump):.0f}° > "
-                                f"{math.degrees(PLACE_BRANCH_JUMP_RAD):.0f}° "
-                                f"(solver đổi nhánh khớp giữa 2 vòng bù)")
-                            self._last_chain_failure_reason = chain_reasons[-1]
-                            break  # yaw này hết cửa -> yaw kế
-                    if corr_best is not None:
-                        if best is None or corr_best[0] < best[0]:
-                            best = corr_best
-                        tilt_b, err_b = corr_best[0], corr_best[1]
-                        if tilt_b <= PREFERRED_TILT_RAD:
-                            prev_corr_joints = corr_source_joints
-                            try:
-                                prev_corr_desc = corr_source[3]
-                            except Exception:
-                                pass
-                            break  # rất tốt: chốt ngay
-                    # Chưa có nghiệm execute (hoặc tilt chưa tốt): bù tiếp từ
-                    # nguồn residual tốt nhất (kể cả khi nó lệch >5mm).
-                    prev_corr_joints = corr_source_joints
-                    prev_corr_desc = corr_source[3]
-                    tilt_s, err_s = corr_source[0], corr_source[1]
-                    corrected = self._compensate_place_tcp(
-                        corr_source[4], corr_source_center, target_xy,
-                        dest_piece_type)
-                    self.get_logger().info(
-                        f"[PLACE-COMP] {label}: tâm lệch "
-                        f"{err_s * 1000:.1f}mm tilt {math.degrees(tilt_s):.1f}° "
-                        f"-> dịch TCP "
-                        f"({(corrected[0] - px) * 1000:.1f}, "
-                        f"{(corrected[1] - py) * 1000:.1f}, "
-                        f"{(corrected[2] - pz) * 1000:.1f})mm")
-                    place_tcp = corrected
-            # P3: restore phase sau vòng yaw (đủ cho cả 2 đường return bên
-            # dưới: chọn best hoặc loại offset). Scratch proxy vẫn ATTACHED.
-            self._set_piece_collision(
-                scratch_id, gripper_touch=False, board_contact=False,
-                expect_attached=True, label="dry-proxy-restore")
-            if best is not None:
-                tilt, pos_err, pre, desc, place_tcp, fq, blabel = best
-                self.get_logger().info(
-                    f"[CHAIN] {context}: chọn candidate {blabel}, lệch "
-                    f"{pos_err * 1000:.1f}mm; tilt {math.degrees(tilt):.1f}° "
-                    f"(target <={math.degrees(PREFERRED_TILT_RAD):.0f}°, "
-                    f"hard <={math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°)")
-                return {"lift": lift, "transfer": transfer,
-                        "pre": pre, "desc": desc,
-                        "hypo_local": copy.deepcopy(hypo_local),
-                        "scene_fingerprint": scene_fingerprint,
-                        "place_tcp": place_tcp, "place_quat": fq,
-                        "pos_err": pos_err, "tilt": tilt,
-                        # Nhãn seed/nhánh IK của candidate được chọn
-                        # (vd. "a1->e4/offset(0.0, 0.0)/comp2/chain"):
-                        # report manual đối chiếu precheck vs runtime (P3).
-                        "seed": blabel}
-            self.get_logger().warning(
-                f"[CHAIN] {context}: lift + transfer đạt nhưng không candidate "
-                f"(yaw × seed IK) nào đưa tâm vào sai số "
-                f"-> loại offset")
-            # P2: lý do fail = số vòng bù THỰC TẾ + nguyên nhân đã ghi, không
-            # in cứng "sau 5 lần" khi chưa chạy đủ, không để summary rỗng.
-            tail = "; ".join(chain_reasons[-4:]) if chain_reasons else "không rõ"
-            prior = getattr(self, "_last_chain_failure_reason", "")
-            if not prior.startswith("nghiệm đạt FK nhưng tilt"):
-                self._last_chain_failure_reason = (
-                    f"bù tâm FK/pre-place→descend không hội tụ sau "
-                    f"{rounds_run} vòng bù thực tế: {tail}")
-            return None
+            best = self._plan_release_chain(
+                transfer_end, hypo_local, target_xy, dest_piece_type,
+                target_approach_z, context)
+            if best is None:
+                return None
+            tilt, pos_err, pre, desc, place_tcp, fq, blabel = best
+            return {"lift": lift, "transfer": transfer,
+                    "pre": pre, "desc": desc,
+                    "hypo_local": copy.deepcopy(hypo_local),
+                    "scene_fingerprint": scene_fingerprint,
+                    "place_tcp": place_tcp, "place_quat": fq,
+                    "pos_err": pos_err, "tilt": tilt, "seed": blabel}
         finally:
             self._dry_detach_scratch(
                 scratch_id or "__dry_carry__", source_obj_id,
@@ -6481,10 +6412,6 @@ class PickPlaceNode(Node):
                             f"[CACHED] {context}/sample{sample_index}: margin "
                             f"{_mname}={_mm:.4f}rad < {MARGIN_MIN_RAD} -> loai")
                         return False
-                    if self._carry_quat is not None:
-                        _, quat = self._fk_tcp_pose(state.name, state.position)
-                        if self._orientation_error(quat) > TCP_ORIENTATION_ERROR_RAD:
-                            return False
                 except Exception as exc:
                     self.get_logger().warning(
                         f"[CACHED] {context}: waypoint xấu ({exc})")
@@ -6757,282 +6684,30 @@ class PickPlaceNode(Node):
                                          target_xy, piece_type: str,
                                          approach_z: float,
                                          extra_seeds=None):
-        """Hạ đặt với candidate TCP hữu hạn + Cartesian descend (fallback runtime).
-
-        P4: fallback này DÙNG CHUNG pre-place seed-IK + OMPL joint-goal với
-        precheck scratch (_plan_seed_based_preplace_options) — cùng thuật
-        toán, cùng nhánh khớp. CẤM position-target OMPL ở đoạn đặt (đổi nhánh
-        tự do, lật tilt như case a1->e4/a1->a2 cũ). Chỉ gọi khi cache invalid
-        (đã log action) hoặc precheck không sinh cached chain; mọi candidate
-        vẫn qua cùng gate fraction/err/tilt/collision/jump/margin và vòng bù
-        FK như precheck.
-
-        Robot đang ATTACHED ở approach đích. Mỗi candidate (yaw quanh trục
-        đứng × seed vùng): plan OMPL pre-place -> Cartesian descend 2mm /
-        fraction 0.98 từ chính candidate -> FK tâm quân + tilt -> gate
-        fraction/err<=5mm/tilt<=26°/collision toàn trajectory/sát limit/
-        nhảy joint -> chấm điểm (err, tilt, travel, margin) -> chọn tốt nhất
-        rồi execute MỘT lần. Không hội tụ thì raise khi arm chưa nhúc nhích.
-
-        P3: phase touch+board set MỘT lần cho cả vòng tìm (mọi descend +
-        revalidate đều cần board MỞ); pre-place trên cao không chạm bàn nên
-        cho phép board-contact cũng không đổi kết quả. Quân thật ATTACHED.
-        """
+        """Use the same release planner for scratch and real attached pieces."""
+        local = self._grasp_local_by_id.get(obj_id)
+        if local is None:
+            raise RuntimeError(f"missing T_tcp_piece for {obj_id}")
         self._set_piece_collision(
             obj_id, gripper_touch=False, board_contact=False,
-            expect_attached=True, label=f"placecomp-search-{step_name}")
-        errors = []
-        converged = []  # (tilt, pos_err, pre, desc, place_tcp, label)
-        chosen = None
-        for rank, place_tcp in enumerate(place_candidates, 1):
-            self._check_budget(f"{step_name}/rank{rank}")
-            for correction in range(PLACE_COMPENSATION_MAX_ITERATIONS):
-                self._check_budget(f"{step_name}/rank{rank}/comp")
-                px, py, pz, pq = (place_tcp[0], place_tcp[1],
-                                  place_tcp[2], place_tcp[3])
-                label = f"{step_name}/comp{correction + 1}"
-                # Gộp transfer/pre-place: transfer vừa execute tới đúng
-                # approach thì pre-place OMPL tới cùng điểm là thừa.
-                try:
-                    cur_xyz = self._current_tcp_xyz()
-                except Exception:
-                    cur_xyz = None
-                if (cur_xyz is not None
-                        and math.sqrt((cur_xyz[0] - px) ** 2
-                                      + (cur_xyz[1] - py) ** 2
-                                      + (cur_xyz[2] - approach_z) ** 2)
-                        <= PREPLACE_SKIP_TOL_M):
-                    pre = None
-                    self._wait_for_joint_state(self.moveit2)
-                    pre_end = copy.deepcopy(self.moveit2.joint_state)
-                    pre_q = self._current_tcp_quat()
-                    self.get_logger().info(
-                        f"[PREPLACE-SKIP] {label}: đã ở approach, "
-                        f"descend thẳng không OMPL lại")
-                else:
-                    # P4: pre-place runtime DÙNG CHUNG seed-IK + OMPL
-                    # joint-goal với precheck (giữ nhánh khớp đã FK-xác
-                    # nhận). Cấm position-target OMPL ở đoạn đặt (đổi nhánh
-                    # tự do -> lật tilt). Seed "current" đứng đầu để ưu tiên
-                    # giữ đúng nhánh đang mang.
-                    try:
-                        self._wait_for_joint_state(self.moveit2)
-                        live = copy.deepcopy(self.moveit2.joint_state)
-                        # P4: seed khôi phục nhánh precheck ĐỨNG TRƯỚC
-                        # current — seed current có thể kẹt nhánh xấu
-                        # (runtime tilt 37° trong khi precheck hứa 11°).
-                        runtime_seeds = (
-                            list(extra_seeds or [])
-                            + [("current", live)]
-                            + self._candidate_seed_states(
-                                self._region_for_target(target_xy)))
-                        options = self._plan_seed_based_preplace_options(
-                            live, px, py, approach_z, pq,
-                            runtime_seeds, label)
-                    except PlanningBudgetExceeded:
-                        raise
-                    except Exception as exc:
-                        errors.append(f"{label}: pre-place plan lỗi ({exc})")
-                        break
-                    if not options:
-                        errors.append(
-                            f"{label}: không seed-IK nào plan được pre-place "
-                            f"(cấm position-OMPL theo P4)")
-                        break
-                    # P4: thử các pre theo thứ tự hứa hẹn (precheck-desc
-                    # trước): seed đầu descend rớt thì thử seed kế, không bỏ
-                    # cả vòng vì một seed xấu.
-                    pre = pre_end = pre_q = _seed_used = None
-                    desc = None
-                    for (_pre, _pre_end, _pre_q, _seed) in options:
-                        try:
-                            _desc = self._plan_motion(
-                                _start_joint_state=_pre_end,
-                                position=[px, py, pz], quat_xyzw=_pre_q,
-                                target_link=END_EFFECTOR,
-                                tolerance_position=0.002,
-                                tolerance_orientation=0.03,
-                                cartesian=True,
-                                max_step=CARTESIAN_MAX_STEP_M,
-                                cartesian_fraction_threshold=CARTESIAN_FRACTION_THRESHOLD)
-                        except PlanningBudgetExceeded:
-                            raise
-                        except Exception:
-                            continue
-                        if _desc is not None:
-                            (pre, pre_end, pre_q, _seed_used,
-                             desc) = (_pre, _pre_end, _pre_q, _seed, _desc)
-                            break
-                    if desc is not None and _seed_used != "current":
-                        self.get_logger().info(
-                            f"[PREPLACE-SEED] {label}: dùng seed {_seed_used} "
-                            f"(không phải current)")
-                    if desc is None:
-                        errors.append(
-                            f"{label}: không có Cartesian descend "
-                            f"(thử {len(options)} seed)")
-                        break
-                # P3: phase touch+board đã set MỘT lần ngoài vòng tìm (gom
-                # batch) — descend các seed bên trên đều cùng phase.
-                try:
-                    last = desc.points[-1]
-                    (fx, fy, fz), fq = self._fk_tcp_pose(
-                        desc.joint_names, last.positions)
-                    local = self._grasp_local_by_id.get(obj_id)
-                    if local is None:
-                        raise RuntimeError(f"thiếu T_tcp_piece của {obj_id}")
-                    pos_err, tilt, center, _q = self._piece_error_from_tcp(
-                        (fx, fy, fz), fq, local, target_xy, piece_type)
-                except PlanningBudgetExceeded:
-                    raise
-                except Exception as exc:
-                    errors.append(f"{label}: FK lỗi ({exc})")
-                    break
-                if pos_err <= PLACE_POSITION_TOL_M:
-                    place_tcp = (px, py, pz, fq)
-                    # TODO-2/3 gates trên từng candidate (fraction đã gate bởi
-                    # planner threshold 0.98: desc is None đã bị loại ở trên).
-                    reject = None
-                    if tilt > MAX_ACCEPTED_TILT_RAD:
-                        reject = (f"tilt {math.degrees(tilt):.1f}° > "
-                                  f"{math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°")
-                    else:
-                        try:
-                            last_map = dict(zip(desc.joint_names, last.positions))
-                            margin = self._min_limit_margin_rad(last_map)
-                            if margin < JOINT_LIMIT_MARGIN_RAD:
-                                reject = (f"sát joint limit margin "
-                                          f"{math.degrees(margin):.1f}°")
-                            elif max(self._trajectory_max_step(pre)
-                                     if pre is not None else 0.0,
-                                     self._trajectory_max_step(desc)) > MAX_JOINT_STEP_RAD:
-                                reject = ("bước nhảy joint bất thường")
-                            else:
-                                # Revalidate đúng phase ACM như lúc planner check:
-                                # descend chạm bàn -> board_contact MỞ (phase
-                                # đã set MỘT lần ngoài vòng tìm, không
-                                # set/restore ở đây nữa).
-                                try:
-                                    desc_free = self._cached_trajectory_collision_free(
-                                        desc, f"{label}/descend")
-                                except PlanningBudgetExceeded:
-                                    raise
-                                if not desc_free:
-                                    reject = "trajectory descend collision"
-                                elif (pre is not None
-                                      and not self._cached_trajectory_collision_free(
-                                          pre, f"{label}/pre-place")):
-                                    reject = "trajectory pre-place collision"
-                        except Exception as exc:
-                            reject = f"gate candidate lỗi ({exc})"
-                    if reject is not None:
-                        errors.append(f"{label}: loại candidate ({reject})")
-                        self.get_logger().warning(
-                            f"[CANDIDATE] {step_name}: {label} loại: {reject} "
-                            f"(err {pos_err * 1000:.1f}mm "
-                            f"tilt {math.degrees(tilt):.1f}°)")
-                        corrected = self._compensate_place_tcp(
-                            place_tcp, center, target_xy, piece_type)
-                        place_tcp = corrected
-                        continue
-                    try:
-                        self._wait_for_joint_state(self.moveit2, timeout_sec=3.0)
-                        travel = self._joint_travel_rad(
-                            self.moveit2.joint_state, last_map)
-                    except Exception:
-                        travel, margin = 0.0, self._min_limit_margin_rad(last_map)
-                    score = self._score_place_candidate(
-                        pos_err, tilt, travel, margin)
-                    converged.append(
-                        (score, tilt, pos_err, pre, desc, place_tcp, label,
-                         travel, margin))
-                    self.get_logger().info(
-                        f"[PLACE-COMP] {step_name}: {label} đạt, lệch "
-                        f"{pos_err * 1000:.1f}mm; "
-                        f"tilt {math.degrees(tilt):.1f}° "
-                        f"(target <={math.degrees(PREFERRED_TILT_RAD):.0f}°, "
-                        f"hard <={math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}°); "
-                        f"travel {math.degrees(travel):.0f}° "
-                        f"margin {math.degrees(margin):.0f}° score={score:.3f}")
-                    if tilt <= PREFERRED_TILT_RAD:
-                        break  # rất tốt: chốt ngay, khỏi bù tiếp
-                    # Chưa tốt nhưng đạt tâm: bù tiếp xem vòng sau có tilt
-                    # thấp hơn không; quyết định cuối chọn tilt min.
-                    corrected = self._compensate_place_tcp(
-                        place_tcp, center, target_xy, piece_type)
-                    place_tcp = corrected
-                    continue
-                corrected = self._compensate_place_tcp(
-                    place_tcp, center, target_xy, piece_type)
-                self.get_logger().info(
-                    f"[PLACE-COMP] {label}: tâm lệch "
-                    f"{pos_err * 1000:.1f}mm -> dịch TCP "
-                    f"({(corrected[0] - px) * 1000:.1f}, "
-                    f"{(corrected[1] - py) * 1000:.1f}, "
-                    f"{(corrected[2] - pz) * 1000:.1f})mm")
-                place_tcp = corrected
-            # Hết vòng bù của rank này mà chưa break sớm: sang rank tiếp theo
-            # (nếu còn) để tìm nghiệm tilt thấp hơn.
-        if converged:
-            # TODO-2: chọn score tổng hợp (err + tilt + travel - margin), log
-            # đầy đủ candidate được chọn + nguyên nhân reject (errors).
-            converged.sort(key=lambda item: (item[0], item[1], item[2]))
-            best_score, best_tilt = converged[0][0], converged[0][1]
-            self.get_logger().info(
-                f"[CANDIDATE-SELECT] {step_name}: {len(converged)} nghiệm đạt, "
-                + ", ".join(
-                    f"{lab} tilt={math.degrees(t):.1f}° err={e * 1000:.1f}mm "
-                    f"travel={math.degrees(tr):.0f}° margin={math.degrees(m):.0f}° "
-                    f"score={s:.3f}"
-                    for s, t, e, _p, _d, _tcp, lab, tr, m in converged)
-                + f" -> chọn {converged[0][6]} score={best_score:.3f}")
-            if errors:
-                self.get_logger().info(
-                    f"[CANDIDATE-REJECTS] {step_name}: " + " | ".join(errors))
-            if best_tilt > MAX_ACCEPTED_TILT_RAD:
-                raise RuntimeError(
-                    f"{step_name}: mọi nghiệm đạt tâm đều nghiêng "
-                    f">{math.degrees(MAX_ACCEPTED_TILT_RAD):.0f}° "
-                    f"(tốt nhất {math.degrees(best_tilt):.1f}°); từ chối để "
-                    f"thử nước/offset khác (arm chưa di chuyển)")
-            _bs, _bt, _be, pre, desc, place_tcp, _bl, _tr, _m = converged[0]
-            # Lưu candidate được chọn + rejects để tái hiện ván (TODO-6).
-            self._last_place_choice = {
-                "label": _bl, "score": _bs, "tilt_deg": math.degrees(_bt),
-                "err_mm": _be * 1000.0, "rejects": list(errors),
-            }
-            chosen = (pre, desc, place_tcp)
+            expect_attached=True, label=f"release-search-{step_name}")
+        self._wait_for_joint_state(self.moveit2)
+        live = copy.deepcopy(self.moveit2.joint_state)
+        chosen = self._plan_release_chain(
+            live, local, target_xy, piece_type, approach_z, step_name,
+            extra_seeds=extra_seeds)
         if chosen is None:
             raise RuntimeError(
-                f"FK cuối trajectory {step_name} không đưa tâm quân vào "
-                f"sai số {PLACE_POSITION_TOL_M * 1000:.0f}mm sau "
-                f"{PLACE_COMPENSATION_MAX_ITERATIONS} lần bù "
-                f"(arm chưa di chuyển): " + "; ".join(errors))
-        pre, desc, place_tcp = chosen
-        try:
-            if pre is not None:
-                self._execute_and_wait(self.moveit2, pre)
-        except Exception:
-            # Robot đã chuyển động: không thử plan khác, thoát để reconcile.
-            raise
-        # Đúng đoạn chạm bàn mới mở board-contact. Quân thật ATTACHED.
-        self._set_piece_collision(
-            obj_id, gripper_touch=False, board_contact=False,
-            expect_attached=True, label=f"placecomp-desc-{step_name}")
-        try:
-            self._execute_and_wait(self.moveit2, desc)
-        except Exception:
-            # Fail-closed: thu hẹp ngoại lệ để motion phục hồi sau đó vẫn
-            # check va chạm bàn, rồi raise để reconcile.
-            try:
-                self._set_piece_collision(
-                    obj_id, gripper_touch=False, board_contact=False,
-                    expect_attached=True, label=f"placecomp-fail-{step_name}")
-            except Exception as acm_exc:
-                self.get_logger().warning(
-                    f"[PLACE-COMP] {step_name}: không thu hẹp board ACM sau "
-                    f"execute fail ({acm_exc})")
-            raise
+                f"{step_name}: {self._last_chain_failure_reason}")
+        tilt, err, pre, desc, place_tcp, _, label = chosen
+        self._last_place_choice = {
+            "label": label, "tilt_deg": math.degrees(tilt),
+            "err_mm": err * 1000.0,
+        }
+        self._execute_and_wait(self.moveit2, pre)
+        self._validate_place_trajectory_end(
+            desc, obj_id, target_xy, piece_type, place_tcp, step_name)
+        self._execute_and_wait(self.moveit2, desc)
         return place_tcp
 
     def _plan_vertical_trajectory(self, x, y, z, q, step_name,

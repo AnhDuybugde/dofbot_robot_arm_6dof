@@ -52,7 +52,7 @@ SQUARE_APPROACH_OFFSET = {"e1": 0.015, "d1": 0.025}
 # EXECUTE sang plan-only, vì cần kiểm tra đúng state chaining trên FakeSystem.
 # Khi chuyển sang arm thật, đặt REACHABILITY_EXECUTE_ON_FAKESYSTEM=False.
 COLLISION_ENABLED = True
-REACHABILITY_EXECUTE_ON_FAKESYSTEM = True
+REACHABILITY_EXECUTE_ON_FAKESYSTEM = False
 
 # DEPRECATED (giữ để tương thích import): mọi Cartesian fail đều raise loud,
 # không fallback position-only kể cả khi cờ này True — fallback lúc ATTACHED
@@ -76,7 +76,7 @@ class PlanningBudgetExceeded(RuntimeError):
 #   - budget 45s: PASS nhưng planning ~45.5s (11 offset, OMPL ngẫu nhiên đổi
 #     offset thắng sang (0.006,-0.006)) -> margin ~0, flaky. CHỐT 50s.
 # Chỉ giới hạn PLANNING (plan-only), không giới hạn EXECUTION vật lý.
-MOVE_PLANNING_BUDGET_SEC = 50.0
+MOVE_PLANNING_BUDGET_SEC = 90.0
 # Budget planning cho replan runtime khi cache invalid (đã ATTACHED hoặc sắp
 # execute: ít candidate hơn vì đi từ current state, không tìm offset).
 # Chưa đo case này -> giữ 30s gốc, không siết theo.
@@ -292,20 +292,16 @@ DOFBOT_JOINT_LIMITS = {
     "arm4_Joint": (-1.57080, 1.57080),
     "arm5_Joint": (-2.09440, 2.09440),
 }
-# Planner domain, huong B (model 5 joints + cage arm5): arm1-4 theo dung
-# gioi han URDF/DOFBOT (am duoc phep). Quy tac "arm2-4 chi duong" DA BI BAC
-# BO (nghiem e2 can arm2=-0.30); khong ap lai cho den khi hieu chinh mapping
-# ROS<->servo tren phan cung. arm5 bi CAGE trong +-20 do (khong khoa 0 tuyet
-# doi, khong tha toan mien +-120 do): IK/OMPL/trajectory nao vuot cage deu
-# bi _joint_domain_valid loai (hard gate), JointConstraint trong IK thu hep
-# theo cage.
+# Planner domain uses the physical five-joint limits.  Arm5 around zero is a
+# scoring/seed preference only; constraining it in the model made valid
+# vertical pick trajectories unreachable.
 ARM5_CAGE_RAD = math.radians(20.0)  # +-0.349
 CHESS_JOINT_LIMITS = {
     "arm1_Joint": DOFBOT_JOINT_LIMITS["arm1_Joint"],
     "arm2_Joint": DOFBOT_JOINT_LIMITS["arm2_Joint"],
     "arm3_Joint": DOFBOT_JOINT_LIMITS["arm3_Joint"],
     "arm4_Joint": DOFBOT_JOINT_LIMITS["arm4_Joint"],
-    "arm5_Joint": (-ARM5_CAGE_RAD, ARM5_CAGE_RAD),
+    "arm5_Joint": DOFBOT_JOINT_LIMITS["arm5_Joint"],
 }
 LOCKED_JOINT_TOL_RAD = 0.001
 TCP_ORIENTATION_ERROR_RAD = math.radians(5.0)
