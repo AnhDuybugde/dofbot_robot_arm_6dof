@@ -2247,9 +2247,13 @@ class MoveIt2:
         move_action_goal.request.planner_id = ""
         move_action_goal.request.group_name = group_name
         move_action_goal.request.num_planning_attempts = 5
-        move_action_goal.request.allowed_planning_time = 0.5
-        move_action_goal.request.max_velocity_scaling_factor = 0.0
-        move_action_goal.request.max_acceleration_scaling_factor = 0.0
+        # Fix 1+2 (safety): 0.0 scaling là invalid (MoveIt có thể fallback về
+        # tốc độ tối đa) và 0.5s planning quá ngắn cho scene 32 quân. Đặt
+        # default an toàn; caller (pick_place _plan_motion /
+        # _require_hardware_gates) sẽ override tường minh mỗi request.
+        move_action_goal.request.allowed_planning_time = 5.0
+        move_action_goal.request.max_velocity_scaling_factor = 0.25
+        move_action_goal.request.max_acceleration_scaling_factor = 0.25
         # Note: Attribute was renamed in Iron (https://github.com/ros-planning/moveit_msgs/pull/130)
         if hasattr(move_action_goal.request, "cartesian_speed_limited_link"):
             move_action_goal.request.cartesian_speed_limited_link = end_effector
@@ -2297,7 +2301,9 @@ class MoveIt2:
         # self.__compute_ik_req.ik_request.robot_state.joint_state = "Set during request"
         # self.__compute_ik_req.ik_request.robot_state.multi_dof_ = "Ignored"
         # self.__compute_ik_req.ik_request.robot_state.attached_collision_objects = "Ignored"
-        self.__compute_ik_req.ik_request.robot_state.is_diff = False
+        # Fix 3: diff=True để giữ attached bodies của scene (quân đang mang).
+        # False + attached rỗng = MoveIt xoá payload khỏi collision check.
+        self.__compute_ik_req.ik_request.robot_state.is_diff = True
         # self.__compute_ik_req.ik_request.constraints = "Set during request OR Ignored"
         self.__compute_ik_req.ik_request.avoid_collisions = True
         # self.__compute_ik_req.ik_request.ik_link_name = "Ignored"

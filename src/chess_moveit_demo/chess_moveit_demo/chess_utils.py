@@ -68,21 +68,26 @@ class PlanningBudgetExceeded(RuntimeError):
     robot. Caller chuẩn hoá thành NACK/PLACE_PRECHECK_FAILED với lý do budget."""
 
 
-# Budget planning cho phase TÌM candidate một nước (targeted 40-60s trên máy
-# VMware + mesh nặng; đo profiling rồi mới giảm về 20-40s). Chỉ giới hạn
-# PLANNING (plan-only), không giới hạn EXECUTION vật lý.
+# Budget planning cho phase TÌM candidate một nước. ĐO THỰC trên sim
+# (10/09/2026, máy VM + 32 collision objects):
+#   - budget 25s: e2->e4 FAIL oan ở offset 8/21 (planning cần ~43s).
+#   - budget 50s: PASS, planning ~43s, offset (0.006,0.0), err 1.2mm/tilt 8.7°.
+#   - budget 45s: PASS nhưng planning ~45.5s (11 offset, OMPL ngẫu nhiên đổi
+#     offset thắng sang (0.006,-0.006)) -> margin ~0, flaky. CHỐT 50s.
+# Chỉ giới hạn PLANNING (plan-only), không giới hạn EXECUTION vật lý.
 MOVE_PLANNING_BUDGET_SEC = 50.0
 # Budget planning cho replan runtime khi cache invalid (đã ATTACHED hoặc sắp
 # execute: ít candidate hơn vì đi từ current state, không tìm offset).
+# Chưa đo case này -> giữ 30s gốc, không siết theo.
 RUNTIME_REPLAN_BUDGET_SEC = 30.0
-# Timeout từng request (một OMPL request 3-5s, Cartesian 2-3s, IK 0.5-1s,
-# scene 1-2s theo review; RRTConnect thường xong <1s ở scene này).
-OMPL_PLANNING_TIMEOUT_SEC = 5.0
-CARTESIAN_PLANNING_TIMEOUT_SEC = 5.0
-IK_WAIT_TIMEOUT_SEC = 1.5
-FK_SERVICE_TIMEOUT_SEC = 2.0
-SCENE_SERVICE_TIMEOUT_SEC = 2.0
-ACM_APPLY_TIMEOUT_SEC = 5.0
+# Timeout từng request trên máy nhanh (OMPL 1-2s, Cartesian 1-2s, IK <0.5s,
+# scene <1s; RRTConnect thường xong <1s ở scene này).
+OMPL_PLANNING_TIMEOUT_SEC = 3.0
+CARTESIAN_PLANNING_TIMEOUT_SEC = 3.0
+IK_WAIT_TIMEOUT_SEC = 1.0
+FK_SERVICE_TIMEOUT_SEC = 1.5
+SCENE_SERVICE_TIMEOUT_SEC = 1.5
+ACM_APPLY_TIMEOUT_SEC = 3.0
 
 # Tổng thời gian tối đa cho tìm candidate gắp 1 ô (Fix 6): thử offset mà
 # không trần thời gian có thể treo lượt đi khi scene khó. Hết trần -> raise

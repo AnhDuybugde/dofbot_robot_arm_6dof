@@ -221,6 +221,20 @@ class PickPlaceNode(Node):
         )
         # Bật cả collision cho Cartesian path. OMPL luôn đọc PlanningScene.
         self.moveit2.cartesian_avoid_collisions = COLLISION_ENABLED
+        # Fix 1 (safety): pymoveit2 khởi tạo scaling = 0.0 (invalid — MoveIt
+        # có thể fallback về tốc độ tối đa). Áp ngay scale an toàn để mọi
+        # request OMPL/Cartesian đều bị giới hạn, kể cả trên FakeSystem.
+        # Giá trị runtime được _require_hardware_gates() re-assert trước
+        # mỗi lần execute.
+        try:
+            _init_scale = float(HARDWARE_SAFE_VELOCITY_SCALE)
+        except Exception:
+            _init_scale = 0.25
+        if not 0.0 < _init_scale <= 1.0:
+            _init_scale = 0.25
+        self.moveit2.max_velocity = _init_scale
+        self.moveit2.max_acceleration = _init_scale
+        self.moveit2.allowed_planning_time = OMPL_PLANNING_TIMEOUT_SEC
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -719,22 +733,39 @@ class PickPlaceNode(Node):
     def _require_hardware_gates(self, uci: str):
         """TODO-7: chặn execute phần cứng khi chưa calibration (fail-loud).
 
-        Sim/FakeSystem (REACHABILITY_EXECUTE_ON_FAKESYSTEM=True) luôn qua.
-        Robot thật yêu cầu: TCP_OFFSET_CALIBRATED=True, velocity scale <= 0.25,
-        low-speed test bật, e-stop sẵn sàng (vận hành thủ công xác nhận qua
-        param). Thiếu -> raise để NACK thay vì chạy mù.
+        Fix 1 (safety): velocity scale PHẢI được áp vào request ở MỌI chế
+        độ (kể cả sim), vì pymoveit2 mặc định 0.0 là invalid và joint_limits
+        đang rất lớn. Sim/FakeSystem
+        (REACHABILITY_EXECUTE_ON_FAKESYSTEM=True) được miễn gate
+        calibration TCP, nhưng KHÔNG được miễn gate tốc độ.
+        Robot thật yêu cầu thêm: TCP_OFFSET_CALIBRATED=True,
+        low-speed test bật. Thiếu -> raise để NACK thay vì chạy mù.
         """
-        if REACHABILITY_EXECUTE_ON_FAKESYSTEM:
-            return
         problems = []
-        if not TCP_OFFSET_CALIBRATED:
-            problems.append("TCP_TO_CONTACT_OFFSET_Z chưa calibration")
         try:
             scale = float(self.get_parameter(
                 "hardware_safe_velocity_scale").value)
             if not 0.0 < scale <= 0.25:
                 problems.append(
                     f"velocity_scale={scale} vượt ngưỡng an toàn 0.25")
+            else:
+                # Áp thật vào request (trước đây chỉ kiểm tra mà không gán).
+                self.moveit2.max_velocity = scale
+                self.moveit2.max_acceleration = scale
+        except Exception as exc:
+            problems.append(f"không đọc/áp param an toàn ({exc})")
+        if REACHABILITY_EXECUTE_ON_FAKESYSTEM:
+            if problems:
+                raise RuntimeError(
+                    f"gate an toàn (kể cả sim) chặn nước {uci}: "
+                    + "; ".join(problems))
+            self.get_logger().warning(
+                "[SAFETY] chạy sim (REACHABILITY_EXECUTE_ON_FAKESYSTEM=True): "
+                "bỏ qua gate calibration TCP. CẤM dùng cờ này trên robot thật.")
+            return
+        if not TCP_OFFSET_CALIBRATED:
+            problems.append("TCP_TO_CONTACT_OFFSET_Z chưa calibration")
+        try:
             if not bool(self.get_parameter("hardware_low_speed_test").value):
                 problems.append("hardware_low_speed_test đang tắt")
         except Exception as exc:
@@ -754,9 +785,17 @@ class PickPlaceNode(Node):
             return {"error": str(exc)}
 
     def _log_move_result(self, cmd: int, uci: str, ok: bool, reason: str = ""):
+        elapsed = None
+        try:
+            t0 = getattr(self, "_move_start_time", None)
+            if t0 is not None:
+                elapsed = round(time.monotonic() - t0, 2)
+        except Exception:
+            elapsed = None
         entry = {
             "seed": self._run_seed, "cmd": cmd, "uci": uci, "ok": ok,
             "reason": reason,
+            "elapsed_sec": elapsed,
             "place_region": self._last_place_region,
             "place_seeds": self._last_place_seed_count,
             "place_choice": self._last_place_choice,
@@ -770,7 +809,8 @@ class PickPlaceNode(Node):
             pass
         self.get_logger().info(
             f"[RUN-LOG] seed={self._run_seed} cmd={cmd} {uci} "
-            f"{'OK' if ok else 'FAIL'} choice={self._last_place_choice}")
+            f"{'OK' if ok else 'FAIL'} elapsed={elapsed}s "
+            f"choice={self._last_place_choice}")
 
     # ---------------- Planning scene ----------------
 
@@ -892,15 +932,17 @@ class PickPlaceNode(Node):
         self._add_piece_collision_at(obj_id, (x, y, BOARD_Z), piece.symbol().lower())
         self._publish_piece_visual(obj_id, (x, y, BOARD_Z), publish=publish)
 
-    def _add_piece_collision_at(self, obj_id: str, xyz, piece_type: str):
+    def _add_piece_collision_at(self, obj_id: str, xyz, piece_type: str,
+                                  quat_xyzw=None):
         if not COLLISION_ENABLED:
             return
         x, y, z = xyz
         col = PIECE_COLLISION[piece_type]
+        q = list(quat_xyzw) if quat_xyzw is not None else [0.0, 0.0, 0.0, 1.0]
         self.moveit2.add_collision_cylinder(
             id=obj_id,
             position=[x, y, z + col["height"] / 2],
-            quat_xyzw=[0.0, 0.0, 0.0, 1.0],
+            quat_xyzw=q,
             height=col["height"],
             radius=col["radius"],
         )
@@ -936,7 +978,8 @@ class PickPlaceNode(Node):
         if publish:
             self._publish_all_visual()
 
-    def _publish_piece_visual(self, obj_id: str, xyz, publish: bool = True):
+    def _publish_piece_visual(self, obj_id: str, xyz, publish: bool = True,
+                                quat_xyzw=None):
         piece_type, is_white = self.piece_info_by_id[obj_id]
         x, y, z = xyz
         phys = PIECE_PHYSICAL[piece_type]
@@ -949,7 +992,13 @@ class PickPlaceNode(Node):
         marker.pose.position.x = x
         marker.pose.position.y = y
         marker.pose.position.z = z + phys["height"] / 2
-        marker.pose.orientation.w = 1.0
+        if quat_xyzw is not None:
+            marker.pose.orientation.x = float(quat_xyzw[0])
+            marker.pose.orientation.y = float(quat_xyzw[1])
+            marker.pose.orientation.z = float(quat_xyzw[2])
+            marker.pose.orientation.w = float(quat_xyzw[3])
+        else:
+            marker.pose.orientation.w = 1.0
         marker.scale.x = marker.scale.y = phys["diameter"]
         marker.scale.z = phys["height"]
         if is_white:
@@ -1635,9 +1684,15 @@ class PickPlaceNode(Node):
             q_piece = self._multiply_quaternions(q_tcp, q_local)
             tilt = self._tilt_from_quaternion(q_piece)
             # Lưu lần đo cuối cho report manual (cả PASS lẫn FAIL đều có số).
+            # Fix 4: giữ cả tâm + orientation thực để _detach_piece dựng
+            # scene theo thực tế thay vì "snap" về pose danh nghĩa.
             self._last_place_verify = {
                 "pos_err_m": float(position_error),
                 "tilt_deg": round(float(math.degrees(tilt)), 1),
+                "actual_xyz": (float(actual[0]), float(actual[1]),
+                               float(actual[2])),
+                "q_piece_xyzw": (float(q_piece[0]), float(q_piece[1]),
+                                 float(q_piece[2]), float(q_piece[3])),
             }
             # P4/P7: pre-release gate cả tâm VÀ tilt. Mở kẹp khi quân nghiêng
             # quá hard limit sẽ đặt lệch/dổ dù tâm đúng.
@@ -2115,7 +2170,56 @@ class PickPlaceNode(Node):
     def _detach_piece(self, obj_id: str, to_square: str, world_xyz, piece_type: str):
         """Gọi NGAY SAU KHI gripper đã mở ở vị trí đặt: gỡ object khỏi
         END_EFFECTOR và thêm lại thành world object tại toạ độ mới.
-        to_square=None nếu thả vào khu 'nghĩa địa' (quân bị ăn), không thuộc bàn cờ."""
+        to_square=None nếu thả vào khu 'nghĩa địa' (quân bị ăn), không thuộc bàn cờ.
+
+        Fix 4: dựng scene theo pose THỰC đo được (tâm + tilt lúc verify),
+        không "snap" về tâm danh nghĩa + thẳng đứng. Gate verify cho phép
+        lệch tới 5mm / 26°; đặt scene về lý tưởng sẽ làm các lần plan sau
+        dựa trên scene khác thực tế (đặc biệt trên robot thật).
+        """
+        # Đo pose thực trước khi detach (arm vẫn ở pose đặt, gripper vừa mở).
+        # Fallback về danh nghĩa nếu không đo được (fail-open có log, không
+        # chặn detach vì quân đã rời gripper).
+        nominal_xyz = tuple(float(v) for v in world_xyz)
+        scene_xyz = nominal_xyz
+        scene_quat = [0.0, 0.0, 0.0, 1.0]
+        try:
+            local = self._grasp_local_by_id.get(obj_id)
+            if local is not None:
+                transform = self.tf_buffer.lookup_transform(
+                    BASE_LINK, END_EFFECTOR, rclpy.time.Time())
+                t = transform.transform.translation
+                q = transform.transform.rotation
+                q_tcp = (q.x, q.y, q.z, q.w)
+                rotated = self._rotate_by_quaternion(
+                    (local.position.x, local.position.y,
+                     local.position.z), q_tcp)
+                actual_center = (t.x + rotated[0], t.y + rotated[1],
+                                 t.z + rotated[2])
+                q_local = (local.orientation.x, local.orientation.y,
+                           local.orientation.z, local.orientation.w)
+                q_piece = self._multiply_quaternions(q_tcp, q_local)
+                # XY thực (quân nằm trên mặt bàn nên Z lấy theo mặt bàn,
+                # không lấy Z trôi của TF).
+                scene_xyz = (float(actual_center[0]), float(actual_center[1]),
+                             float(nominal_xyz[2]))
+                scene_quat = [float(v) for v in self._normalize_quaternion(
+                    tuple(q_piece))]
+                dev_mm = math.sqrt(
+                    (scene_xyz[0] - nominal_xyz[0]) ** 2
+                    + (scene_xyz[1] - nominal_xyz[1]) ** 2) * 1000.0
+                tilt_deg = math.degrees(self._tilt_from_quaternion(q_piece))
+                if dev_mm > 0.5 or tilt_deg > 1.0:
+                    self.get_logger().warning(
+                        f"[SCENE-DRIFT] {obj_id}: scene giữ pose thực "
+                        f"(lệch tâm {dev_mm:.1f}mm, nghiêng {tilt_deg:.1f}°) "
+                        f"thay vì snap về danh nghĩa {nominal_xyz}")
+        except Exception as exc:
+            self.get_logger().warning(
+                f"[SCENE-DRIFT] {obj_id}: không đo được pose thực ({exc}); "
+                f"dùng pose danh nghĩa {nominal_xyz}")
+            scene_xyz = nominal_xyz
+            scene_quat = [0.0, 0.0, 0.0, 1.0]
         if COLLISION_ENABLED:
             aco = AttachedCollisionObject()
             aco.link_name = END_EFFECTOR
@@ -2123,7 +2227,8 @@ class PickPlaceNode(Node):
             aco.object.operation = CollisionObject.REMOVE
             self._apply_attached_object(aco)
 
-        self._add_piece_collision_at(obj_id, world_xyz, piece_type)
+        self._add_piece_collision_at(obj_id, scene_xyz, piece_type,
+                                     quat_xyzw=scene_quat)
         if COLLISION_ENABLED:
             self._wait_for_scene_object(obj_id, attached=False)
             # P3: chuyển attached->world đổi tập entry scene -> clear cache ACM.
@@ -2131,7 +2236,7 @@ class PickPlaceNode(Node):
         old_type, is_white = self.piece_info_by_id[obj_id]
         if old_type != piece_type:  # phong cấp: tốt thành hậu/xe/tượng/mã
             self.piece_info_by_id[obj_id] = (piece_type, is_white)
-        self._publish_piece_visual(obj_id, world_xyz)
+        self._publish_piece_visual(obj_id, scene_xyz, quat_xyzw=scene_quat)
         if self.carried_piece_id == obj_id:
             self.carried_piece_id = None
         if to_square is not None:
@@ -2141,7 +2246,7 @@ class PickPlaceNode(Node):
         # TODO-5: sau detach, quân trở lại world đúng vị trí, không double.
         if COLLISION_ENABLED:
             self._assert_scene_invariant(
-                f"detach {obj_id}", expect_world_pose=(obj_id, world_xyz, piece_type))
+                f"detach {obj_id}", expect_world_pose=(obj_id, scene_xyz, piece_type))
 
     # ---------------- Move execution ----------------
 
@@ -2459,6 +2564,7 @@ class PickPlaceNode(Node):
     def _execute_move(self, payload: dict):
         uci = payload["uci"]
         cmd = int(payload.get("command_id", 0))
+        self._move_start_time = time.monotonic()
         if cmd <= 0:
             self._fail(cmd, uci, "thiếu command_id hợp lệ")
             return
@@ -2601,9 +2707,11 @@ class PickPlaceNode(Node):
             rook_from, rook_to = self._castling_rook_squares(move.uci())
             self._move_virtual_piece(rook_from, rook_to, "r")
 
-    def _wait_for_motion_planner(self, timeout_sec: float = 180.0):
+    def _wait_for_motion_planner(self, timeout_sec: float = 60.0):
         """Chờ đúng service mà pymoveit2 dùng để lập kế hoạch.
 
+        Profile máy nhanh: move_group thường lên trong <30s; giữ 60s cho
+        nước đầu, các case gọi riêng có thể truyền timeout nhỏ hơn.
         Đây là wait có giới hạn, chạy trong worker thread nên executor ROS vẫn
         xử lý joint state, RViz và các service khác trong lúc chờ.
         """
@@ -4214,6 +4322,14 @@ class PickPlaceNode(Node):
                                    self._planning_timeout(default_timeout))
         else:
             planning_timeout = self._planning_timeout(default_timeout)
+        # Fix 2: timeout client PHẢI đi kèm allowed_planning_time trong
+        # MotionPlanRequest. Trước đây chỉ chờ future 5s nhưng request luôn
+        # 0.5s nên planner tự dừng sau 0.5s -> fail oan ở scene đông quân.
+        if not cartesian:
+            try:
+                self.moveit2.allowed_planning_time = float(planning_timeout)
+            except Exception:
+                pass
         start = (_start_joint_state if _start_joint_state is not None
                  else self.moveit2.joint_state)
         future = self.moveit2.plan_async(
@@ -4687,7 +4803,11 @@ class PickPlaceNode(Node):
         ik.avoid_collisions = True
         ik.robot_state = RobotState()
         ik.robot_state.joint_state = copy.deepcopy(seed_state)
-        ik.robot_state.is_diff = False
+        # Fix 3: PHẢI là diff (True) để giữ attached objects (quân đang
+        # mang / scratch) từ PlanningScene hiện tại. False + mảng attached
+        # rỗng bị MoveIt hiểu là "xoá toàn bộ attached" -> avoid_collisions
+        # kiểm tra thiếu payload, có thể chọn nghiệm va chạm với quân mang.
+        ik.robot_state.is_diff = True
         ik.pose_stamped = PoseStamped()
         ik.pose_stamped.header.frame_id = BASE_LINK
         ik.pose_stamped.pose.position.x = float(position[0])
