@@ -18,6 +18,8 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
+from .chess_utils import ACK_TIMEOUT_SEC
+
 STOCKFISH_PATH = "/usr/games/stockfish"   # chạy `which stockfish` để lấy đường dẫn đúng máy bạn
 MOVE_TIME_LIMIT = 0.3                      # giây suy nghĩ mỗi nước, tăng nếu muốn nước đi "khôn" hơn
 
@@ -132,7 +134,13 @@ class ChessBrainNode(Node):
             self.game_running = False
             return
 
-        result = self.engine.play(self.board, chess.engine.Limit(time=MOVE_TIME_LIMIT))
+        try:
+            result = self.engine.play(self.board, chess.engine.Limit(time=MOVE_TIME_LIMIT))
+            if result.move is None or result.move not in self.board.legal_moves:
+                raise RuntimeError("engine returned no legal move")
+        except Exception as exc:
+            self._stop_game(f"engine failure: {exc}")
+            return
         move = result.move
         piece = self.board.piece_at(move.from_square)
 
@@ -163,9 +171,9 @@ class ChessBrainNode(Node):
         self.inflight_cmd = cmd
         msg = String()
         msg.data = json.dumps(payload)
-        self.move_pub.publish(msg)
         self.waiting_for_ack = True
         self.last_pub_time = time.monotonic()
+        self.move_pub.publish(msg)
         self.move_count += 1
         # Log gọn terminal launch: thành công 1 dòng ngắn, lỗi mới chi tiết.
         self.get_logger().info(
@@ -218,6 +226,9 @@ class ChessBrainNode(Node):
         self._stop_game(f"nước {self.inflight_uci} thất bại phía robot: {msg.data}")
 
     def _stop_game(self, reason: str):
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
         self.game_running = False
         self.waiting_for_ack = False
         self.inflight_uci = None
@@ -234,7 +245,7 @@ class ChessBrainNode(Node):
     def _watchdog(self):
         if self.game_running and self.waiting_for_ack and self.last_pub_time:
             stalled = time.monotonic() - self.last_pub_time
-            if stalled > 600.0:
+            if stalled > ACK_TIMEOUT_SEC:
                 self._stop_game(
                     f"treo {stalled:.0f}s không ACK/NACK cho {self.inflight_uci}"
                 )

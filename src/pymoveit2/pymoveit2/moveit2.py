@@ -76,6 +76,7 @@ class MoveIt2:
         end_effector_name: str,
         group_name: str = "arm",
         execute_via_moveit: bool = False,
+        exclude_joints: Optional[List[str]] = None,
         ignore_new_calls_while_executing: bool = False,
         callback_group: Optional[CallbackGroup] = None,
         follow_joint_trajectory_action_name: str = "DEPRECATED",
@@ -142,6 +143,11 @@ class MoveIt2:
         # Flag that determines whether a new goal can be sent while the previous one is being executed
         self.__ignore_new_calls_while_executing = ignore_new_calls_while_executing
 
+        # Joints nay KHONG BAO GIO gui trong request state (branch
+        # exp/arm5-fixed: arm5 khong co trong planning model; gui kem lam
+        # move_group abort trong robotStateMsgToRobotState).
+        self.__exclude_joints = tuple(exclude_joints or [])
+
         # Store additional variables for later use
         self.__joint_names = joint_names
         self.__base_link_name = base_link_name
@@ -154,7 +160,8 @@ class MoveIt2:
         self.motion_suceeded = False
         self.__execution_goal_handle = None
         self.__last_error_code = None
-        self.__execution_mutex = threading.Lock()
+        self.__execution_mutex = threading.RLock()
+        self.__cancel_requested = False
 
         # Create subscriber for current joint states
         self._node.create_subscription(
@@ -304,6 +311,21 @@ class MoveIt2:
         )
 
     #### Execution Polling Functions
+    def _without_excluded(self, js):
+        """Ban copy JointState da loai exclude_joints (giua nguyen goc)."""
+        if js is None or not self.__exclude_joints:
+            return js
+        out = JointState()
+        out.header = js.header
+        out.name = [n for n in js.name if n not in self.__exclude_joints]
+        idx = [list(js.name).index(n) for n in out.name]
+        out.position = [float(js.position[i]) for i in idx]
+        if js.velocity:
+            out.velocity = [float(js.velocity[i]) for i in idx]
+        if js.effort:
+            out.effort = [float(js.effort[i]) for i in idx]
+        return out
+
     def query_state(self) -> MoveIt2State:
         with self.__execution_mutex:
             if self.__is_motion_requested:
@@ -314,13 +336,14 @@ class MoveIt2:
                 return MoveIt2State.IDLE
 
     def cancel_execution(self):
-        if self.query_state() != MoveIt2State.EXECUTING:
-            self._node.get_logger().warning("Attempted to cancel without active goal.")
-            return None
-
-        cancel_string = String()
-        cancel_string.data = "stop"
-        self.__cancellation_pub.publish(cancel_string)
+        with self.__execution_mutex:
+            if not (self.__is_motion_requested or self.__is_executing):
+                return None
+            self.__cancel_requested = True
+            handle = self.__execution_goal_handle
+        if handle is not None:
+            return handle.cancel_goal_async()
+        return None
 
     def get_execution_future(self) -> Optional[Future]:
         if self.query_state() != MoveIt2State.EXECUTING:
@@ -413,7 +436,7 @@ class MoveIt2:
             # Define starting state as the current state
             if self.joint_state is not None:
                 self.__move_action_goal.request.start_state.joint_state = (
-                    self.joint_state
+                    self._without_excluded(self.joint_state)
                 )
             # Send to goal to the server (async) - both planning and execution
             self._send_goal_async_move_action()
@@ -470,7 +493,7 @@ class MoveIt2:
             # Define starting state as the current state
             if self.joint_state is not None:
                 self.__move_action_goal.request.start_state.joint_state = (
-                    self.joint_state
+                    self._without_excluded(self.joint_state)
                 )
             # Send to goal to the server (async) - both planning and execution
             self._send_goal_async_move_action()
@@ -655,7 +678,7 @@ class MoveIt2:
         if start_joint_state is not None:
             if isinstance(start_joint_state, JointState):
                 self.__move_action_goal.request.start_state.joint_state = (
-                    start_joint_state
+                    self._without_excluded(start_joint_state)
                 )
             else:
                 # start_joint_state is a list of positions
@@ -667,7 +690,8 @@ class MoveIt2:
                 )
         elif self.joint_state is not None:
             # Default to the latest observed state if none provided
-            self.__move_action_goal.request.start_state.joint_state = self.joint_state
+            self.__move_action_goal.request.start_state.joint_state = (
+                self._without_excluded(self.joint_state))
 
         # The request above only replaces joint positions.  Keep attached
         # collision objects from the monitored PlanningScene (real carried
@@ -767,7 +791,7 @@ class MoveIt2:
             )
             return
 
-        self._send_goal_async_execute_trajectory(goal=execute_trajectory_goal)
+        return self._send_goal_async_execute_trajectory(goal=execute_trajectory_goal)
 
     def wait_until_executed(self) -> bool:
         """
@@ -2101,6 +2125,8 @@ class MoveIt2:
 
     def _send_goal_async_move_action(self):
         with self.__execution_mutex:
+            if self.__is_motion_requested or self.__is_executing:
+                raise RuntimeError("An execution goal is already active")
             stamp = self._node.get_clock().now().to_msg()
             self.__move_action_goal.request.workspace_parameters.header.stamp = stamp
             if not self.__move_action_client.server_is_ready():
@@ -2110,6 +2136,7 @@ class MoveIt2:
                 return
 
             self.__last_error_code = None
+            self.__cancel_requested = False
             self.__is_motion_requested = True
             # Reset per-goal: lệnh mới chưa có kết quả thì không được đọc lại
             # True của lệnh trước (reject/timeout sẽ giữ False).
@@ -2127,6 +2154,8 @@ class MoveIt2:
 
     def __response_callback_move_action(self, response):
         with self.__execution_mutex:
+            if response is not self.__send_goal_future_move_action:
+                return
             goal_handle = response.result()
             if not goal_handle.accepted:
                 self._node.get_logger().warning(
@@ -2137,6 +2166,8 @@ class MoveIt2:
                 return
 
             self.__execution_goal_handle = goal_handle
+            if self.__cancel_requested:
+                goal_handle.cancel_goal_async()
             self.__is_executing = True
             self.__is_motion_requested = False
 
@@ -2147,6 +2178,8 @@ class MoveIt2:
 
     def __result_callback_move_action(self, res):
         with self.__execution_mutex:
+            if res is not self.__get_result_future_move_action:
+                return
             result = res.result()
             if (result.status != GoalStatus.STATUS_SUCCEEDED
                     or result.result.error_code.val != MoveItErrorCodes.SUCCESS):
@@ -2167,6 +2200,8 @@ class MoveIt2:
         goal: ExecuteTrajectory,
     ):
         with self.__execution_mutex:
+            if self.__is_motion_requested or self.__is_executing:
+                raise RuntimeError("An execution goal is already active")
             if not self._execute_trajectory_action_client.server_is_ready():
                 self._node.get_logger().warning(
                     f"Action server '{self._execute_trajectory_action_client._action_name}' is not yet available. Better luck next time!"
@@ -2174,6 +2209,7 @@ class MoveIt2:
                 return
 
             self.__last_error_code = None
+            self.__cancel_requested = False
             self.__is_motion_requested = True
             # Reset per-goal (xem _send_goal_async_move_action).
             self.motion_suceeded = False
@@ -2187,9 +2223,12 @@ class MoveIt2:
             self.__send_goal_future_execute_trajectory.add_done_callback(
                 self.__response_callback_execute_trajectory
             )
+            return self.__send_goal_future_execute_trajectory
 
     def __response_callback_execute_trajectory(self, response):
         with self.__execution_mutex:
+            if response is not self.__send_goal_future_execute_trajectory:
+                return
             goal_handle = response.result()
             if not goal_handle.accepted:
                 self._node.get_logger().warning(
@@ -2200,6 +2239,8 @@ class MoveIt2:
                 return
 
             self.__execution_goal_handle = goal_handle
+            if self.__cancel_requested:
+                goal_handle.cancel_goal_async()
             self.__is_executing = True
             self.__is_motion_requested = False
 
@@ -2210,6 +2251,8 @@ class MoveIt2:
 
     def __result_callback_execute_trajectory(self, res):
         with self.__execution_mutex:
+            if res is not self.__get_result_future_execute_trajectory:
+                return
             result = res.result()
             if (result.status != GoalStatus.STATUS_SUCCEEDED
                     or result.result.error_code.val != MoveItErrorCodes.SUCCESS):

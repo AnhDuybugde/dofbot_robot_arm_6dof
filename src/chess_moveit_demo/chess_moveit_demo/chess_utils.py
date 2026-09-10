@@ -6,6 +6,7 @@ CHỈNH các hằng số bên dưới theo bàn cờ ảo bạn dựng trong RVi
 """
 
 from dataclasses import dataclass
+import math
 
 # ==== BÀN CỜ THẬT 24 cm (đơn vị mét trong MoveIt) — CHỐT ====
 # Mapping: X=rank, Y=file (giữ hàng 1 gần robot đã verify IK, không xoay).
@@ -80,14 +81,57 @@ MOVE_PLANNING_BUDGET_SEC = 50.0
 # execute: ít candidate hơn vì đi từ current state, không tìm offset).
 # Chưa đo case này -> giữ 30s gốc, không siết theo.
 RUNTIME_REPLAN_BUDGET_SEC = 30.0
-# Timeout từng request trên máy nhanh (OMPL 1-2s, Cartesian 1-2s, IK <0.5s,
-# scene <1s; RRTConnect thường xong <1s ở scene này).
-OMPL_PLANNING_TIMEOUT_SEC = 3.0
-CARTESIAN_PLANNING_TIMEOUT_SEC = 3.0
-IK_WAIT_TIMEOUT_SEC = 1.0
+# Timeout từng request: OMPL/Cartesian/IK về giá trị gốc (5/5/1.5s).
+# ĐO 10/09/2026: siết 3/3/1.0s làm transfer/place rớt vào nhánh tilt xấu dưới
+# scene strict deny-all (không còn legacy entry lenient) — comp loop phân kỳ
+# err 8->17mm + branch-jump. Vài giây/request rẻ hơn nước fail. FK/scene/ACM
+# là roundtrip thuần, giữ siết (1.5/1.5/3.0) vì không ảnh hưởng chất lượng.
+OMPL_PLANNING_TIMEOUT_SEC = 5.0
+CARTESIAN_PLANNING_TIMEOUT_SEC = 5.0
+IK_WAIT_TIMEOUT_SEC = 1.5
 FK_SERVICE_TIMEOUT_SEC = 1.5
 SCENE_SERVICE_TIMEOUT_SEC = 1.5
 ACM_APPLY_TIMEOUT_SEC = 3.0
+
+# ==== DENY-ALL: không còn ngoại lệ tiếp xúc ACM (đo 10/09/2026) ====
+# MoveIt Humble ngó lơ entry ACM MỚI qua mọi đường apply (diff/full/topic/
+# attach/monitored-topic đều trả success nhưng không land; chỉ flip giá trị
+# cũ land — cùng triệu chứng upstream moveit#3527). Entry một khi mất thì
+# không thể tạo lại cho tới khi restart move_group. Vì vậy pipeline KHÔNG
+# được phụ thuộc bất kỳ exception tiếp xúc nào; mọi goal/state phải
+# geometrically-valid dưới default-deny, an toàn do gate hình học strict gánh.
+# - CONTACT_HOVER_M: gắp/đặt hover bấy nhiêu trên điểm chạm danh nghĩa để
+#   goal descend và start lift/start validity không dính contact (attached-vs-
+#   world CÓ check; world-vs-world không check). Trong dung sai 5mm; attach
+#   đo T_tcp_piece từ TF sống nên hover tự nhất quán precheck/runtime.
+# - GRASP_PROUD_MARGIN_RAD: siết cuối lùi lại bấy nhiêu so với close_rad để
+#   goal close (planned qua MoveIt) không chạm mặt quân. Sim grasp là
+#   bookkeeping (attach + visual chaining, FakeSystem không có vật lý) nên
+#   proud không ảnh hưởng kết quả; ROBOT THẬT cần thêm stage siết direct
+#   (GripperCommand thẳng, unplanned -> không cần ACM bao giờ) với mapping
+#   đo thật (P8), chưa làm ở đây.
+CONTACT_HOVER_M = 0.001
+GRASP_PROUD_MARGIN_RAD = 0.0
+
+# ==== ORIENTATION DISCIPLINE (step-3, đo thực strict deny-all) ====
+# TCP convention: FK tại HOME cho tilt ĐÚNG 90° (Z TCP nằm ngang khi tay ở
+# pose up). Mọi motion mang (approach/lift/transfer/pre-place/descend) phải
+# giữ TCP quanh mốc này; lệch nhiều = KDL/OMPL whim nhánh lật (đo thực IK
+# nghiệm tilt 133° dù seed thẳng đứng, transfer cuối 122-134° rồi place chết
+# ở gate 26°). Lọc tilt NGAY tại IK target (rẻ, ms) thay vì để tilt mang
+# suốt chuỗi rồi comp phân kỳ:
+# - SEED_IK_TILT_TOL_RAD: IK target lệch quá mốc này -> bỏ seed (thử seed kế).
+# - TRANSFER_TILT_TOL_RAD: transfer cuối lệch quá mốc này -> loại offset ngay
+#   (place không cứu được — đã chứng minh 3 runs), khỏi đốt budget comp.
+# Nằm giữa 11° desired và 26° hard của gate đặt.
+TCP_GRASP_TILT_RAD = math.pi / 2
+SEED_IK_TILT_TOL_RAD = 0.30
+TRANSFER_TILT_TOL_RAD = 0.35
+# Gate tilt gắp (đo thực compounding: grasp 17° + seed 17° -> piece 35° chết
+# gate 26°; comp dịch tịnh không sửa được xoay). Grasp lệch quá mốc này ->
+# loại offset ngay (rẻ, trước sweep/chain đắt). 12° + seed 17° = worst 29°,
+# typical ~10° ≈ 11° desired; gate đặt 26° hard chốt cuối.
+GRASP_TILT_TOL_RAD = 0.21
 
 # Tổng thời gian tối đa cho tìm candidate gắp 1 ô (Fix 6): thử offset mà
 # không trần thời gian có thể treo lượt đi khi scene khó. Hết trần -> raise
@@ -112,7 +156,13 @@ class PieceSpec:
     # lý): khép SƠ BỘ ở cao độ approach trước descend + mở VỪA ĐỦ khi release
     # (không mở hết cỡ). Phải thỏa open <= preclose <= close và
     # open <= release <= close (validate ở dưới, fail-loud lúc import).
-    gripper_preclose_rad: float = 0.7
+    # Override của user 10/09/2026: preclose 75° (1.309) và close 80° (1.396)
+    # đồng nhất mọi loại quân. LƯU Ý: descend chạy ở độ rộng preclose — 75° hẹp
+    # hơn 40° cũ nhiều, phải lọt quân to nhất (vua Ø18-20mm) + sai số vị trí,
+    # không thì Cartesian descend rớt fraction; close đồng nhất có thể ôm hờ vua
+    # (sim ok, bookkeeping) hoặc xuyên tốt (goal invalid). Sim test sẽ trả lời
+    # vì chưa có bảng map rad->mm (P8).
+    gripper_preclose_rad: float = math.radians(75.0)
     gripper_release_rad: float = 0.7
 
 
@@ -141,13 +191,15 @@ PIECE_COLLISION = {
 # Giá trị close là default SIM (chưa phải calibration vật lý): tốt nhỏ nhất
 # nên khép ít nhất; các quân lớn giữ 1.57 đã chứng minh plan/execute được.
 # Đừng suy mm->rad tuyến tính (khớp mimic phi tuyến); bảng FK đo thật là P8.
+# Override user 10/09/2026: close 80° (1.396) đồng nhất mọi loại (thử nghiệm;
+# xem lưu ý ở PieceSpec.preclose về descend/siết).
 PIECE_SPECS = {
-    "p": PieceSpec(pickup_height=0.026, gripper_open_rad=0.0, gripper_close_rad=1.30),
-    "r": PieceSpec(pickup_height=0.030, gripper_open_rad=0.0, gripper_close_rad=1.57),
-    "n": PieceSpec(pickup_height=0.034, gripper_open_rad=0.0, gripper_close_rad=1.57),
-    "b": PieceSpec(pickup_height=0.038, gripper_open_rad=0.0, gripper_close_rad=1.57),
-    "q": PieceSpec(pickup_height=0.044, gripper_open_rad=0.0, gripper_close_rad=1.57),
-    "k": PieceSpec(pickup_height=0.050, gripper_open_rad=0.0, gripper_close_rad=1.57),
+    "p": PieceSpec(pickup_height=0.026, gripper_open_rad=0.0, gripper_close_rad=1.396),
+    "r": PieceSpec(pickup_height=0.030, gripper_open_rad=0.0, gripper_close_rad=1.396),
+    "n": PieceSpec(pickup_height=0.034, gripper_open_rad=0.0, gripper_close_rad=1.396),
+    "b": PieceSpec(pickup_height=0.038, gripper_open_rad=0.0, gripper_close_rad=1.396),
+    "q": PieceSpec(pickup_height=0.044, gripper_open_rad=0.0, gripper_close_rad=1.396),
+    "k": PieceSpec(pickup_height=0.050, gripper_open_rad=0.0, gripper_close_rad=1.396),
 }
 
 # "Nghĩa địa" quân bị ăn: lưới 4x4=16 slot cạnh bàn phía -Y (bên file a),
@@ -240,17 +292,53 @@ DOFBOT_JOINT_LIMITS = {
     "arm4_Joint": (-1.57080, 1.57080),
     "arm5_Joint": (-2.09440, 2.09440),
 }
+# Planner domain, huong B (model 5 joints + cage arm5): arm1-4 theo dung
+# gioi han URDF/DOFBOT (am duoc phep). Quy tac "arm2-4 chi duong" DA BI BAC
+# BO (nghiem e2 can arm2=-0.30); khong ap lai cho den khi hieu chinh mapping
+# ROS<->servo tren phan cung. arm5 bi CAGE trong +-20 do (khong khoa 0 tuyet
+# doi, khong tha toan mien +-120 do): IK/OMPL/trajectory nao vuot cage deu
+# bi _joint_domain_valid loai (hard gate), JointConstraint trong IK thu hep
+# theo cage.
+ARM5_CAGE_RAD = math.radians(20.0)  # +-0.349
+CHESS_JOINT_LIMITS = {
+    "arm1_Joint": DOFBOT_JOINT_LIMITS["arm1_Joint"],
+    "arm2_Joint": DOFBOT_JOINT_LIMITS["arm2_Joint"],
+    "arm3_Joint": DOFBOT_JOINT_LIMITS["arm3_Joint"],
+    "arm4_Joint": DOFBOT_JOINT_LIMITS["arm4_Joint"],
+    "arm5_Joint": (-ARM5_CAGE_RAD, ARM5_CAGE_RAD),
+}
+LOCKED_JOINT_TOL_RAD = 0.001
+TCP_ORIENTATION_ERROR_RAD = math.radians(5.0)
+COMMAND_TIMEOUT_SEC = 480.0
+ACK_TIMEOUT_SEC = COMMAND_TIMEOUT_SEC + 15.0
+# Simulation only. Hardware continues to require calibrated gripper widths.
+# (Vong lap override close=80 toan cuc da don: gia tri close nam truc tiep
+# trong PIECE_SPECS, mot moi duy nhat.)
 JOINT_LIMIT_MARGIN_RAD = 0.05
+# Gate margin cung (buoc C): candidate co margin < MARGIN_MIN_RAD so voi URDF
+# limit thi bi loai, pipeline thu seed ke (fail-loud neu het seed). Warn khi
+# duoi MARGIN_WARN_RAD de theo doi doan sat gioi han.
+MARGIN_MIN_RAD = 0.02
+MARGIN_WARN_RAD = 0.10
+# Far-rank grasp_z tam thoi (buoc b: a8/h8 UNREACHABLE o grasp-z chuan 0.059;
+# cua so kha thi do duoc >=0.077 (a8) / >=0.075 (h8), lay +1mm an toan).
+# TAM THOI cho sim (attach la bookkeeping); y nghia gap vat ly o cao do nay
+# CHO hardware calibration (co HW_GRASP_Z_PENDING).
+FAR_RANK_GRASP_Z = {"a8": 0.078, "h8": 0.076}
+HW_GRASP_Z_PENDING = True
 # Bước nhảy joint bất thường trong một trajectory (rad giữa 2 waypoint kề).
 MAX_JOINT_STEP_RAD = 0.6
 # Scoring candidate (TODO-2): trọng số cho err (m), tilt (rad), travel (rad),
-# margin tới limit (rad, càng xa càng tốt nên trừ điểm).
+# margin tới limit (rad, càng xa càng tốt nên trừ điểm), |arm5| (rad, cang
+# nho cang tot — uu tien nghiem gan 0 trong cage, huong B).
 CANDIDATE_SCORE_W_POS = 1.0 / 0.005
 CANDIDATE_SCORE_W_TILT = 1.0 / 0.45
 CANDIDATE_SCORE_W_TRAVEL = 0.15
 CANDIDATE_SCORE_W_LIMIT_MARGIN = -0.5
+CANDIDATE_SCORE_W_ARM5 = 0.5
 # Template joint theo vùng bàn cờ (TODO-2/3): seed IK ưu tiên theo vùng để
 # phủ nhánh khớp khác nhau thay vì mọi ô cùng một seed HOME.
+# Huong B: 5 phan tu (arm1-5); arm5 seed = 0.0 (giua cage, uu tien |arm5| min).
 REGION_JOINT_TEMPLATES = {
     # rank 1-2 gần đế: gập gọn tránh tự va.
     "near": [0.0, -0.5, 1.0, -0.5, 0.0],
@@ -319,12 +407,6 @@ def gripper_width_to_joint_angle(width_m: float) -> float:
 GRASP_APPROACH_CANDIDATE_OFFSETS = (
     (0.0, 0.0),
     (0.003, 0.0), (-0.003, 0.0), (0.0, 0.003), (0.0, -0.003),
-    (0.006, 0.0), (-0.006, 0.0), (0.0, 0.006), (0.0, -0.006),
-    (0.006, 0.006), (0.006, -0.006),
-    (-0.006, 0.006), (-0.006, -0.006),
-    (0.008, 0.0), (-0.008, 0.0), (0.0, 0.008), (0.0, -0.008),
-    (0.008, 0.008), (0.008, -0.008),
-    (-0.008, 0.008), (-0.008, -0.008),
 )
 
 
@@ -353,17 +435,29 @@ def square_to_grasp_pose(square: str, piece_type: str, offset_xy=(0.0, 0.0)):
 
     Cộng offset lệch tâm nếu có
     (offset_xy mô phỏng vai trò của position-regression model trong bản gốc;
-    ở chế độ giả lập không có camera thì để mặc định (0, 0))."""
+    ở chế độ giả lập không có camera thì để mặc định (0, 0)).
+
+    Deny-all: +CONTACT_HOVER_M để goal descend và start lift không dính
+    contact hình học (không còn exception ACM nào land được).
+
+    Branch exp/arm5-fixed: o far-rank a8/h8 dung FAR_RANK_GRASP_Z tam thoi
+    (UNREACHABLE o grasp-z chuan; HW_GRASP_Z_PENDING=True)."""
     x, y = square_to_xy(square)
     x += offset_xy[0]
     y += offset_xy[1]
-    return x, y, PIECE_GRIP_Z.get(piece_type, PICK_TCP_Z)
+    if square in FAR_RANK_GRASP_Z:
+        return x, y, FAR_RANK_GRASP_Z[square] + CONTACT_HOVER_M
+    return x, y, PIECE_GRIP_Z.get(piece_type, PICK_TCP_Z) + CONTACT_HOVER_M
 
 
 def square_to_place_pose(square: str, piece_type: str):
-    """TCP khi đặt quân tại tâm ô; không áp dụng offset clearance của pick."""
+    """TCP khi đặt quân tại tâm ô; không áp dụng offset clearance của pick.
+
+    Deny-all: +CONTACT_HOVER_M như grasp (quân attached chạm bàn ở goal
+    descend là attached-vs-world, BỊ check). Detach visual vẫn ở BOARD_Z
+    (đường detach dùng BOARD_Z/zd trực tiếp, không qua pose này)."""
     x, y = square_to_xy(square)
-    return x, y, PIECE_GRIP_Z.get(piece_type, PICK_TCP_Z)
+    return x, y, PIECE_GRIP_Z.get(piece_type, PICK_TCP_Z) + CONTACT_HOVER_M
 
 
 def approach_tcp_z(square: str, pick_tcp_z: float = PICK_TCP_Z) -> float:
@@ -396,3 +490,55 @@ def discard_slot_pose(index: int):
     x = DISCARD_ORIGIN[0] + col * DISCARD_DX
     y = DISCARD_ORIGIN[1] - row * DISCARD_DY
     return x, y, DISCARD_ORIGIN[2]
+
+
+# Mô hình chess dùng đầy đủ arm1..arm5. Không lọc arm5 khỏi RobotState: nó là
+# bậc tự do cần thiết để giữ hướng TCP. Miền CHESS_JOINT_LIMITS là gate cứng
+# cho arm5 trong ±20 độ.
+UNMODELED_JOINTS = frozenset()
+
+
+# ==== BRANCH exp/arm5-fixed-pipeline: margin + occupancy helpers ====
+def joint_margins(values: dict, limits: dict | None = None) -> dict:
+    """Margin den URDF limit theo tung joint (rad, am = vuot gioi han)."""
+    lim = CHESS_JOINT_LIMITS if limits is None else limits
+    out = {}
+    for name, (lo, hi) in lim.items():
+        v = values.get(name)
+        out[name] = min(float(v) - lo, hi - float(v)) if v is not None else float("inf")
+    return out
+
+
+def min_margin(values: dict, limits: dict | None = None):
+    """(ten_joint, margin_min). Dung cho gate candidate buoc C."""
+    m = joint_margins(values, limits)
+    name = min(m, key=lambda k: m[k])
+    return name, m[name]
+
+
+# Quan cao co the cham ngon kep khi descend o ke ben (bai hoc d1/e1 buoc b:
+# Llink2 vs vua e1). Tinh huong PHU THUOC occupancy hien tai, KHONG hard-code
+# o co dinh nao la unreachable.
+TALL_PIECE_HEIGHT_M = 0.038
+
+
+def tall_neighbor_situation(square: str, piece_type_by_square: dict) -> list:
+    """Liet ke (o_ke, loai_quan) cao dang dung quanh `square`."""
+    out = []
+    try:
+        fi = FILES.index(square[0].lower())
+        ri = int(square[1]) - 1
+    except (ValueError, IndexError):
+        return out
+    for df in (-1, 0, 1):
+        for dr in (-1, 0, 1):
+            if df == 0 and dr == 0:
+                continue
+            f2, r2 = fi + df, ri + dr
+            if 0 <= f2 < 8 and 0 <= r2 < 8:
+                nb = f"{FILES[f2]}{r2 + 1}"
+                pt = piece_type_by_square.get(nb)
+                spec = PIECE_SPECS.get(pt) if pt else None
+                if spec is not None and spec.pickup_height >= TALL_PIECE_HEIGHT_M:
+                    out.append((nb, pt))
+    return out

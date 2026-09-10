@@ -1,15 +1,47 @@
 """Khởi động Dofbot MoveIt2 fake-control + RViz rồi chạy demo cờ."""
 
+import fcntl
+import os
+import tempfile
+
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument, EmitEvent, IncludeLaunchDescription, OpaqueFunction,
+    RegisterEventHandler, SetEnvironmentVariable,
+)
+from launch.event_handlers import OnProcessExit, OnShutdown
+from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from moveit_configs_utils import MoveItConfigsBuilder
 
 
 def generate_launch_description():
+    session_lock = []
+
+    def acquire_session(context):
+        domain = int(LaunchConfiguration("ros_domain_id").perform(context))
+        if not 0 <= domain <= 101:
+            raise RuntimeError("ros_domain_id must be between 0 and 101")
+        path = os.path.join(
+            tempfile.gettempdir(), f"dofbot-chess-{os.getuid()}-{domain}.lock")
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise RuntimeError(f"Chess simulation already running in ROS domain {domain}")
+        session_lock.append(fd)
+        return [SetEnvironmentVariable("ROS_DOMAIN_ID", str(domain))]
+
+    def release_session(context):
+        for fd in session_lock:
+            os.close(fd)
+        session_lock.clear()
+        return []
+
     moveit_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution(
@@ -18,7 +50,12 @@ def generate_launch_description():
         ),
         # Demo MoveIt mặc định cũng mở RViz với config cho task rót trà. Demo cờ
         # tự mở RViz bên dưới để đăng ký MarkerArray /chess/visual.
-        launch_arguments={"use_rviz": "false"}.items(),
+        launch_arguments={
+            "use_rviz": "false",
+            "model": PythonExpression([
+                "'dofbot_fixed' if '", LaunchConfiguration("use_fixed_model"),
+                "' == 'true' else 'dofbot'"]),
+        }.items(),
     )
 
     moveit_config = (
@@ -61,4 +98,19 @@ def generate_launch_description():
     # TODO-1: bỏ timer cố định 12s. Brain/pick-place start ngay cùng MoveIt;
     # pick_place tự gate READY (scene 33/33 + planner + controller +
     # joint_states) rồi publish /chess/system_ready; brain chỉ đi khi READY.
-    return LaunchDescription([moveit_launch, chess_rviz, chess_brain, pick_place])
+    return LaunchDescription([
+        DeclareLaunchArgument("ros_domain_id", default_value="42"),
+        DeclareLaunchArgument(
+            "use_fixed_model", default_value="false",
+            description="false: use five-joint arm_group with arm5 constrained to ±20 degrees"),
+        OpaqueFunction(function=acquire_session),
+        RegisterEventHandler(OnShutdown(
+            on_shutdown=[OpaqueFunction(function=release_session)])),
+        RegisterEventHandler(OnProcessExit(
+            target_action=pick_place,
+            on_exit=[EmitEvent(event=Shutdown(reason="Pick-place executor exited"))])),
+        RegisterEventHandler(OnProcessExit(
+            target_action=chess_brain,
+            on_exit=[EmitEvent(event=Shutdown(reason="Chess brain exited"))])),
+        moveit_launch, chess_rviz, chess_brain, pick_place,
+    ])
