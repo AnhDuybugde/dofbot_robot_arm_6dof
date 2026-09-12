@@ -18,7 +18,7 @@ def generate_launch_description():
         Node(package="robot_state_publisher", executable="robot_state_publisher",
              name="chess_robot_state_publisher", parameters=[description]),
         Node(package="controller_manager", executable="ros2_control_node",
-             name="chess_ros2_control", parameters=[description, controllers]),
+             parameters=[description, controllers]),
         Node(package="controller_manager", executable="spawner",
              arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager"]),
         Node(package="controller_manager", executable="spawner",
