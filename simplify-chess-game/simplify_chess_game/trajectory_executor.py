@@ -82,8 +82,16 @@ class TrajectoryExecutor:
         goal.trajectory.joint_names = ARM_JOINTS
         point = JointTrajectoryPoint()
         point.positions = [float(q) for q in target]
-        point.velocities = [float(self.config["max_velocity_rad_s"])] * 5
-        point.accelerations = [float(self.config["max_acceleration_rad_s2"])] * 5
+        # These fields are setpoints, not limits: use signed velocities so a
+        # negative joint move is not accidentally sent a positive velocity.
+        point.velocities = [
+            max(-float(self.config["max_velocity_rad_s"]),
+                min(float(self.config["max_velocity_rad_s"]),
+                    (target_q - start_q) / duration))
+            for start_q, target_q in zip(start, target)
+        ]
+        # Leave acceleration unconstrained at the point level; the controller's
+        # configured limits remain authoritative and avoid a false sign claim.
         point.time_from_start = self._duration_msg(duration)
         goal.trajectory.points = [point]
         goal.goal_time_tolerance = self._duration_msg(1.0)
