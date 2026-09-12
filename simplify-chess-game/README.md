@@ -60,6 +60,18 @@ ros2 run simplify_chess_game chess_cli
 ros2 run simplify_chess_game audit_routes
 ```
 
+Backend không tự mở GUI. Nếu muốn xem robot trong RViz, mở terminal khác và
+chạy:
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export ROS_LOG_DIR=/tmp/ros-log
+ros2 launch dofbot_tea_moveit tea_rviz.launch.py
+```
+
+RViz dùng chung `/robot_description` và `/joint_states` từ backend.
+
 MoveIt có thể trả về nhiều waypoint. Có thể nén offline (giữ nguyên HOME và
 endpoint, không gọi planner runtime) để giảm thời gian replay:
 
