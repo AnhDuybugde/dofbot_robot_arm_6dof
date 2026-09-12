@@ -94,6 +94,17 @@ move> list-routes
 move> quit
 ```
 
+`test b2` đưa robot HOME rồi chạy cả chiều đi và chiều về. `test-reverse b2`
+chỉ chạy chiều `b2 -> HOME`, vì vậy trước lệnh này robot phải đang ở endpoint
+của b2 (thường dùng ngay sau khi teach hoặc sau khi chạy chiều đi).
+
+Lưu ý quan trọng: file mẫu chưa thể tự chạy một ván cờ ngay sau khi clone.
+Joint angle không thể suy ra an toàn chỉ từ XYZ; cần teach và xác nhận từng
+route trên phần cứng. Khi chưa có route hợp lệ, lệnh `b2 b4` sẽ fail-fast với
+`no validated route` thay vì gọi IK/planner hoặc tự đoán góc. Sau khi đủ 64
+route được đánh dấu `VALIDATED`, cùng một CLI sẽ chạy được mọi ô theo pipeline
+deterministic ở trên.
+
 Trong move bình thường gripper chỉ có `PRE_CLOSE`, `CLOSE`, `PRE_CLOSE`
 (release), cấu hình tại `config/gripper.yaml`. `piece_grip_adjustment` chỉ là
 placeholder cho tương lai; milestone này dùng một giá trị chung.

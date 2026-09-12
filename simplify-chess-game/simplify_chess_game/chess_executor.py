@@ -72,6 +72,12 @@ class ChessExecutor(Node):
     def test_square(self, square: str, *, reverse_only: bool = False,
                     allow_unvalidated: bool = False) -> None:
         route = self.db.test_route(square) if allow_unvalidated else self.db.executable_route(square)
+        if reverse_only:
+            # The operator is expected to have the arm at the square endpoint.
+            # Do not silently replay outbound motion when explicitly testing return.
+            self.executor.execute_route(list(reversed(route)), square=square,
+                                        label="square -> HOME reverse test")
+            return
         self.home_robot()
         self.executor.execute_route(route, square=square, label="HOME -> square test")
         # A return route must always begin from the square endpoint, never from HOME.
