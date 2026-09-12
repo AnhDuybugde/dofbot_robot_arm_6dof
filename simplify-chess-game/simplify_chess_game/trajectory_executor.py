@@ -42,6 +42,16 @@ class TrajectoryExecutor:
             return [self.current[name] for name in ARM_JOINTS]
         return None
 
+    def wait_for_joint_state(self) -> list[float]:
+        """Allow the subscription callback to receive a complete state."""
+        deadline = time.monotonic() + float(self.config["action_server_timeout_s"])
+        while time.monotonic() < deadline:
+            actual = self.actual_arm()
+            if actual is not None:
+                return actual
+            rclpy.spin_once(self.node, timeout_sec=0.1)
+        raise ExecutionError("no complete /joint_states received; refusing blind execution")
+
     def wait_ready(self) -> None:
         timeout = float(self.config["action_server_timeout_s"])
         if not self.client.wait_for_server(timeout_sec=timeout):
@@ -74,9 +84,7 @@ class TrajectoryExecutor:
         if len(target) != 5:
             raise ExecutionError("target must contain arm1..arm5")
         self.wait_ready()
-        start = self.actual_arm()
-        if start is None:
-            raise ExecutionError("no complete /joint_states received; refusing blind execution")
+        start = self.wait_for_joint_state()
         duration = self._duration(start, target)
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = ARM_JOINTS

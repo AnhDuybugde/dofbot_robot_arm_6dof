@@ -39,7 +39,8 @@ class ChessExecutor(Node):
         self.gripper_config = load_yaml(config_path("gripper.yaml"))
         self.db = RouteDatabase(routes_path or default_routes_path(),
                                 self.home["home_joints"], self.home["home_tolerance_rad"])
-        self.executor = TrajectoryExecutor(self, self.safety, self._log)
+        # `executor` is a reserved rclpy.Node property; never shadow it.
+        self.trajectory_executor = TrajectoryExecutor(self, self.safety, self._log)
         self.gripper = GripperController(self, self.safety, self.gripper_config, self._log)
         self.log_path = Path(self.safety["log_path"])
         self.gripper_state = "UNKNOWN"
@@ -59,15 +60,15 @@ class ChessExecutor(Node):
             self.get_logger().error(f"cannot write execution log: {exc}")
 
     def home_robot(self) -> None:
-        self.executor.execute_waypoint(self.home["home_joints"], square="HOME", index=0,
-                                       label="HOME confirmed")
+        self.trajectory_executor.execute_waypoint(
+            self.home["home_joints"], square="HOME", index=0, label="HOME confirmed")
 
     def set_gripper(self, state: str, square: str) -> None:
         self.gripper.set(state, square)
         self.gripper_state = state
 
     def stop(self) -> None:
-        self.executor.stop()
+        self.trajectory_executor.stop()
 
     def test_square(self, square: str, *, reverse_only: bool = False,
                     allow_unvalidated: bool = False) -> None:
@@ -75,14 +76,14 @@ class ChessExecutor(Node):
         if reverse_only:
             # The operator is expected to have the arm at the square endpoint.
             # Do not silently replay outbound motion when explicitly testing return.
-            self.executor.execute_route(list(reversed(route)), square=square,
-                                        label="square -> HOME reverse test")
+            self.trajectory_executor.execute_route(
+                list(reversed(route)), square=square, label="square -> HOME reverse test")
             return
         self.home_robot()
-        self.executor.execute_route(route, square=square, label="HOME -> square test")
+        self.trajectory_executor.execute_route(route, square=square, label="HOME -> square test")
         # A return route must always begin from the square endpoint, never from HOME.
-        self.executor.execute_route(list(reversed(route)), square=square,
-                                    label="square -> HOME reverse test")
+        self.trajectory_executor.execute_route(
+            list(reversed(route)), square=square, label="square -> HOME reverse test")
 
     def move(self, source: str, target: str) -> None:
         # Lookup first so missing/disabled routes fail before the robot starts moving.
@@ -94,23 +95,26 @@ class ChessExecutor(Node):
         print("[2] gripper PRE_CLOSE")
         self.set_gripper("PRE_CLOSE", source)
         print(f"[3] execute HOME -> {source}")
-        self.executor.execute_route(source_route, square=source, label="HOME -> PICK")
+        self.trajectory_executor.execute_route(source_route, square=source, label="HOME -> PICK")
         print("[4] gripper CLOSE")
         self.set_gripper("CLOSE", source)
         print(f"[5] execute {source} -> HOME")
-        self.executor.execute_route(list(reversed(source_route)), square=source, label="PICK -> HOME")
+        self.trajectory_executor.execute_route(
+            list(reversed(source_route)), square=source, label="PICK -> HOME")
         print(f"[6] execute HOME -> {target}")
-        self.executor.execute_route(target_route, square=target, label="HOME -> DROP")
+        self.trajectory_executor.execute_route(target_route, square=target, label="HOME -> DROP")
         print("[7] gripper PRE_CLOSE / RELEASE")
         self.set_gripper("PRE_CLOSE", target)
         print(f"[8] execute {target} -> HOME")
-        self.executor.execute_route(list(reversed(target_route)), square=target, label="DROP -> HOME")
+        self.trajectory_executor.execute_route(
+            list(reversed(target_route)), square=target, label="DROP -> HOME")
         print("MOVE COMPLETE")
 
     def status(self) -> str:
         validated = [square for square in self.db.data["routes"]
                      if self.db.get(square).status == "VALIDATED" and self.db.get(square).validated]
-        return f"routes validated: {len(validated)}/64; current arm: {self.executor.actual_arm()}"
+        return (f"routes validated: {len(validated)}/64; current arm: "
+                f"{self.trajectory_executor.actual_arm()}")
 
     def list_routes(self) -> list[str]:
         return [f"{square}: {self.db.get(square).status} ({len(self.db.get(square).route)} waypoints)"

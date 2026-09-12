@@ -60,6 +60,37 @@ ros2 run simplify_chess_game chess_cli
 ros2 run simplify_chess_game audit_routes
 ```
 
+MoveIt có thể trả về nhiều waypoint. Có thể nén offline (giữ nguyên HOME và
+endpoint, không gọi planner runtime) để giảm thời gian replay:
+
+```bash
+ros2 run simplify_chess_game offline_ik_calibrate --compress-existing 40
+```
+
+Nếu cần tạo route ban đầu bằng MoveIt **offline** (chỉ chạy khi backend
+`tea_backend.launch.py` đang bật), dùng:
+
+```bash
+ros2 run simplify_chess_game offline_ik_calibrate --square b2
+ros2 run simplify_chess_game offline_ik_calibrate  # thử cả 64 ô
+```
+
+Tool này chỉ ghi kết quả MoveIt vào YAML; mặc định vẫn để `UNCALIBRATED`.
+Chỉ dùng `--validate` sau khi đã kiểm tra route trên robot thật:
+
+```bash
+ros2 run simplify_chess_game offline_ik_calibrate --square b2 --validate
+```
+
+Khi đã tạo đủ route và chỉ muốn bật chúng cho fake controller mà không lập kế
+hoạch lại, dùng `--validate-existing`. Đây là xác nhận offline; trước khi chạy
+robot thật vẫn phải kiểm tra giới hạn khớp, collision và vị trí quân:
+
+```bash
+ros2 run simplify_chess_game offline_ik_calibrate --validate-existing
+ros2 run simplify_chess_game audit_routes
+```
+
 Khi chạy từ checkout, tool mặc định ghi vào
 `simplify-chess-game/config/square_routes.yaml`. Với bản đã cài ở nơi chỉ đọc,
 truyền một file copy có thể ghi được:

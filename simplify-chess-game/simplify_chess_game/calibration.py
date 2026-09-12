@@ -51,12 +51,12 @@ def main() -> None:
                     node.home_robot()
                 elif command == "goto" and len(words) == 6:
                     target = [float(value) for value in words[1:]]
-                    node.executor.execute_waypoint(target, square=square, index=len(route),
-                                                   label="calibration jog")
+                    node.trajectory_executor.execute_waypoint(
+                        target, square=square, index=len(route), label="calibration jog")
                 elif command == "capture":
                     # Give /joint_states one short spin if the terminal started instantly.
                     rclpy.spin_once(node, timeout_sec=0.1)
-                    actual = node.executor.actual_arm()
+                    actual = node.trajectory_executor.actual_arm()
                     if actual is None:
                         raise ExecutionError("no complete arm joint state to capture")
                     route.append([round(q, 6) for q in actual])
