@@ -60,14 +60,20 @@ ros2 run simplify_chess_game chess_cli
 ros2 run simplify_chess_game audit_routes
 ```
 
-Backend không tự mở GUI. Nếu muốn xem robot trong RViz, mở terminal khác và
-chạy:
+Backend chess độc lập không dùng `tea_backend` và không khởi động `move_group`.
+Chạy controller-only backend bằng:
+
+```bash
+ros2 launch simplify_chess_game simplify_backend.launch.py
+```
+
+Nếu muốn xem robot trong RViz, mở terminal khác và chạy:
 
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 export ROS_LOG_DIR=/tmp/ros-log
-ros2 launch dofbot_tea_moveit tea_rviz.launch.py
+ros2 launch simplify_chess_game simplify_rviz.launch.py
 ```
 
 RViz dùng chung `/robot_description` và `/joint_states` từ backend.

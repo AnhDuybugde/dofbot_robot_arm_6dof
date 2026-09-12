@@ -13,6 +13,9 @@ setup(
             "config/home.yaml", "config/gripper.yaml", "config/safety.yaml",
             "config/square_routes.yaml",
         ]),
+        ("share/" + package_name + "/launch", [
+            "launch/simplify_backend.launch.py", "launch/simplify_rviz.launch.py",
+        ]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
