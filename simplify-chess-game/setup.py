@@ -24,5 +24,6 @@ setup(
         "calibrate_square = simplify_chess_game.calibration:main",
         "audit_routes = simplify_chess_game.route_audit:main",
         "offline_ik_calibrate = simplify_chess_game.offline_ik_calibrate:main",
+        "chess_board_viz = simplify_chess_game.board_visualizer:main",
     ]},
 )

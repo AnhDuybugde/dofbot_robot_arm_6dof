@@ -77,6 +77,8 @@ ros2 launch simplify_chess_game simplify_rviz.launch.py
 ```
 
 RViz dùng chung `/robot_description` và `/joint_states` từ backend.
+Launch RViz cũng tự chạy `chess_board_viz` để publish 64 ô lên
+`/chess/visual`; CLI `status` không phải lệnh hiển thị bàn cờ.
 
 MoveIt có thể trả về nhiều waypoint. Có thể nén offline (giữ nguyên HOME và
 endpoint, không gọi planner runtime) để giảm thời gian replay:

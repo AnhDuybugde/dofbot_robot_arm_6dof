@@ -17,4 +17,6 @@ def generate_launch_description():
         Node(package="rviz2", executable="rviz2", name="simplify_chess_rviz",
              arguments=["-d", os.path.join(chess_share, "config", "chess_lite.rviz")],
              parameters=[description], output="screen")
+        ,Node(package="simplify_chess_game", executable="chess_board_viz",
+             name="simplify_chess_board_visualizer", output="screen")
     ])
