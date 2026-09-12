@@ -19,5 +19,6 @@ setup(
     entry_points={"console_scripts": [
         "chess_cli = simplify_chess_game.chess_cli:main",
         "calibrate_square = simplify_chess_game.calibration:main",
+        "audit_routes = simplify_chess_game.route_audit:main",
     ]},
 )

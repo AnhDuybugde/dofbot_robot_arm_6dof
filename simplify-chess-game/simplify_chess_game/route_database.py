@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any
 
@@ -76,11 +77,30 @@ class RouteDatabase:
         return entry.route
 
     def _validate_shape_and_home(self, entry: SquareRoute) -> None:
+        if len(self.home_joints) != 5:
+            raise RouteError("HOME_JOINTS must contain exactly 5 arm joints")
         if len(entry.route) < 2:
             raise RouteError(f"square {entry.square} has no usable route; record HOME and a grip pose")
         first = entry.route[0]
+        if any(not math.isfinite(q) for point in entry.route for q in point):
+            raise RouteError(f"{entry.square}: route contains NaN or infinity")
         if any(abs(q - h) > self.home_tolerance for q, h in zip(first, self.home_joints)):
             raise RouteError(f"{entry.square}: first waypoint is not HOME; route rejected")
+
+    def validate_all(self, *, validated_only: bool = False) -> list[str]:
+        """Validate every stored route and return human-readable failures."""
+        failures = []
+        for square in SQUARES:
+            entry = self.get(square)
+            if validated_only and not (entry.status == "VALIDATED" and entry.validated):
+                continue
+            if not entry.route:
+                continue
+            try:
+                self._validate_shape_and_home(entry)
+            except RouteError as exc:
+                failures.append(str(exc))
+        return failures
 
     def replace_route(self, square: str, route: list[list[float]], notes: str | None = None) -> None:
         square = self._check_square(square)

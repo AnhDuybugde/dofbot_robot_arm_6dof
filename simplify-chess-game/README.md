@@ -57,6 +57,7 @@ colcon build --packages-select simplify_chess_game
 source install/setup.bash
 ros2 run simplify_chess_game calibrate_square b2
 ros2 run simplify_chess_game chess_cli
+ros2 run simplify_chess_game audit_routes
 ```
 
 Khi chạy từ checkout, tool mặc định ghi vào
@@ -67,6 +68,10 @@ truyền một file copy có thể ghi được:
 ros2 run simplify_chess_game calibrate_square b2 --routes /path/to/square_routes.yaml
 ros2 run simplify_chess_game chess_cli --routes /path/to/square_routes.yaml
 ```
+
+`audit_routes` chỉ đọc YAML, không kết nối robot và không chạy planner. Lệnh
+này kiểm tra waypoint có đủ 5 joint, finite, và bắt đầu tại HOME; dùng trước
+khi đánh dấu hoặc deploy nhiều route.
 
 ## Calibration
 
