@@ -93,6 +93,10 @@ def generate_launch_description():
         executable="pick_place_node",
         name="chess_pick_place_node",
         output="screen",
+        # Sim-only: cho phep execute tren FakeSystem (khong tai). Launch
+        # hardware TUYET DOI khong duoc set param nay (mac dinh False = khoa
+        # nhu robot that, doi calibration TCP + low-speed test).
+        parameters=[{"sim_allow_execute": True}],
     )
 
     # TODO-1: bỏ timer cố định 12s. Brain/pick-place start ngay cùng MoveIt;

@@ -14,7 +14,7 @@ Visualization Manager:
       Value: /chess/visual
     Value: true
   Global Options:
-    Fixed Frame: world
+    Fixed Frame: base_link
   Views:
     Current:
       Class: rviz_default_plugins/Orbit

@@ -110,7 +110,7 @@ ACM_APPLY_TIMEOUT_SEC = 3.0
 #   proud không ảnh hưởng kết quả; ROBOT THẬT cần thêm stage siết direct
 #   (GripperCommand thẳng, unplanned -> không cần ACM bao giờ) với mapping
 #   đo thật (P8), chưa làm ở đây.
-CONTACT_HOVER_M = 0.001
+CONTACT_HOVER_M = 0.003
 GRASP_PROUD_MARGIN_RAD = 0.0
 
 # ==== ORIENTATION DISCIPLINE (step-3, đo thực strict deny-all) ====
@@ -242,6 +242,16 @@ PIECE_GRIP_Z = dict(PIECE_GRIP_Z_SIM)
 # có bảng FK gripper_width_to_joint_angle đo thật (P8).
 GRIPPER_OPEN_RAD = 0.0
 GRIPPER_CLOSED_RAD = 1.57
+# Release HẸP fallback khi mở chuẩn (0.7) quẹt quân lân cận ở ô đích đông
+# (đo thực f3: mở tới 1.1 đã chạm tốt f2/g2, 1.2 còn sạch; ô cờ 26mm).
+# Ngón ở hold đã PROUD (không chạm quân) nên mở thêm ~11° rồi detach
+# bookkeeping là đủ trong sim (FakeSystem không vật lý). Chỉ dùng khi mở
+# chuẩn plan-fail; mở rộng được thì vẫn ưu tiên mở rộng.
+GRIPPER_RELEASE_NARROW_RAD = 1.2
+# Trần tốc độ cho fast_demo TRONG SIM (FakeSystem không tải). Robot thật
+# không bao giờ vượt 0.25 (gate cứng). Chỉ có hiệu lực khi đồng thời
+# sim_allow_execute=True và fast_demo=True; mặc định tắt (=0.25 như cũ).
+SIM_FAST_VELOCITY_CAP = 0.6
 # 3 phase widths tương lai: cần bảng FK/calibration joint->khoảng cách mặt
 # trong finger trước (đo trong RViz rồi hiệu chỉnh servo thật).
 HIGH_APPROACH_INNER_WIDTH = 0.020
@@ -265,7 +275,11 @@ for _pt, _spec in PIECE_SPECS.items():
             f"release={_spec.gripper_release_rad} close={_spec.gripper_close_rad}")
 del _pt, _spec
 # Motion: bỏ RETREAT 40mm, dùng chung clearance 65mm cho cả 3 bước.
-CARTESIAN_EEF_STEP = 0.002
+# Cartesian step 1mm (thay vi 2mm): finger hep preclose 75 do suot ngang
+# quan cao lang gieng (vd. vua e1 cach e2 26mm); step 2mm co the nhay qua
+# diem suot giua 2 waypoint trong khi revalidate joint-interp bat duoc.
+# Planner thay duoc thi precheck loai offset do ngay, khoi fail o execution.
+CARTESIAN_EEF_STEP = 0.001
 MIN_CARTESIAN_FRACTION = 0.98
 
 # ==== HẠ TẦNG / READY GATE (TODO-1) ====
@@ -310,7 +324,14 @@ ACK_TIMEOUT_SEC = COMMAND_TIMEOUT_SEC + 15.0
 # Simulation only. Hardware continues to require calibrated gripper widths.
 # (Vong lap override close=80 toan cuc da don: gia tri close nam truc tiep
 # trong PIECE_SPECS, mot moi duy nhat.)
-JOINT_LIMIT_MARGIN_RAD = 0.05
+# Margin an toan so voi URDF limit (CHOT theo spec: 0.02 rad). Dung chung cho
+# optimizer bounds release-chain va gate margin toan duong: khong co 2 chuan
+# (0.05/0.02) song song gay loai oan nghiem nam tren bound.
+JOINT_LIMIT_MARGIN_RAD = 0.02
+# Dung sai chạm-đích khi đặt quân: đáy quân mang trong ±tol so với mặt bàn
+# thì contact attached<->board là chạm đặt hợp lệ (không phải va chạm).
+# Mọi contact khác (tay<->bàn, quân<->quân, chạm khi còn ở cao) vẫn veto.
+RELEASE_TOUCH_TOL_M = 0.004
 # Gate margin cung (buoc C): candidate co margin < MARGIN_MIN_RAD so voi URDF
 # limit thi bi loai, pipeline thu seed ke (fail-loud neu het seed). Warn khi
 # duoi MARGIN_WARN_RAD de theo doi doan sat gioi han.

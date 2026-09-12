@@ -17,14 +17,26 @@ def test_templates_5elem():
 
 
 def test_arm5_cage():
+    # Kien truc moi (f6b997a): arm5 dung full URDF range, ±20 deg chi la
+    # preference/scoring (ARM5_CAGE_RAD, ARM5_PREFERENCE_SEEDS), KHONG phai
+    # hard gate trong CHESS_JOINT_LIMITS (cage cung lam pick vo nghiem).
     assert "arm5_Joint" in C.CHESS_JOINT_LIMITS
     assert set(C.CHESS_JOINT_LIMITS) == {
         "arm1_Joint", "arm2_Joint", "arm3_Joint", "arm4_Joint", "arm5_Joint"}
     lo, _ = C.CHESS_JOINT_LIMITS["arm2_Joint"]
     assert lo < 0.0  # quy tac duong da bo
     lo5, hi5 = C.CHESS_JOINT_LIMITS["arm5_Joint"]
-    assert abs(lo5 + math.radians(20.0)) < 1e-9
-    assert abs(hi5 - math.radians(20.0)) < 1e-9
+    assert abs(lo5 - C.DOFBOT_JOINT_LIMITS["arm5_Joint"][0]) < 1e-9
+    assert abs(hi5 - C.DOFBOT_JOINT_LIMITS["arm5_Joint"][1]) < 1e-9
+    assert abs(C.ARM5_CAGE_RAD - math.radians(20.0)) < 1e-9
+
+
+def test_release_gates():
+    # Spec giu: margin 0.02, fraction 0.98; cham-dat trong tol khong phai collision.
+    assert abs(C.JOINT_LIMIT_MARGIN_RAD - 0.02) < 1e-9
+    assert abs(C.MARGIN_MIN_RAD - 0.02) < 1e-9
+    assert abs(C.MIN_CARTESIAN_FRACTION - 0.98) < 1e-9
+    assert C.RELEASE_TOUCH_TOL_M > 0.0
 
 
 def test_margins():
