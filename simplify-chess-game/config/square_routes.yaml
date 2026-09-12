@@ -1,0 +1,71 @@
+# This is the only runtime route database. Values are intentionally empty: do not
+# invent joint angles from XYZ. Record and validate each square with calibrate_square.
+version: 1
+# Reserved for future capture moves. It follows the same HOME-first / reverse-return
+# rule as a square route and remains unavailable until explicitly calibrated.
+discard_route: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+routes:
+  a1: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  b1: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  c1: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  d1: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  e1: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  f1: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  g1: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  h1: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  a2: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  b2: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  c2: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  d2: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  e2: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  f2: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  g2: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  h2: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  a3: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  b3: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  c3: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  d3: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  e3: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  f3: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  g3: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  h3: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  a4: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  b4: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  c4: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  d4: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  e4: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  f4: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  g4: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  h4: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  a5: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  b5: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  c5: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  d5: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  e5: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  f5: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  g5: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  h5: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  a6: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  b6: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  c6: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  d6: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  e6: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  f6: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  g6: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  h6: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  a7: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  b7: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  c7: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  d7: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  e7: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  f7: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  g7: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  h7: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  a8: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  b8: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  c8: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  d8: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  e8: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  f8: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  g8: {status: UNCALIBRATED, validated: false, route: [], notes: ''}
+  h8: {status: UNCALIBRATED, validated: false, route: [], notes: ''}

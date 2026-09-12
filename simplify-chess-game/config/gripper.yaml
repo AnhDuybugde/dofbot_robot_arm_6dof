@@ -1,0 +1,8 @@
+# First calibration values.  PRE_CLOSE is used both before descending and to release.
+# Tune these two values on the physical gripper before operating on real pieces.
+gripper_joint: Rlink1_Joint
+GRIPPER_PRE_CLOSE: 1.20
+GRIPPER_CLOSE: 1.396
+# Reserved for later only. Runtime deliberately does not apply these values yet.
+common_grip_height_m: null
+piece_grip_adjustment: {p: null, r: null, n: null, b: null, q: null, k: null}

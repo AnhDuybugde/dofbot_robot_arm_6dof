@@ -1,0 +1,3 @@
+# All calibrated arm routes must start at this same state (radians).
+home_joints: [0.0, 0.0, 0.0, 0.0, 0.0]
+home_tolerance_rad: 0.08
