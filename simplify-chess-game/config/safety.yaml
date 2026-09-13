@@ -16,4 +16,11 @@ route_timeout_s: 180.0
 gripper_timeout_s: 8.0
 action_server_timeout_s: 5.0
 endpoint_tolerance_rad: 0.08
+# Worst-case neighbour clearance for offline route validation
+# (scripts/validate_routes.py). Minimum allowed horizontal gap between any
+# gripper/wrist capsule (J4->J5, J5->TCP, fingers, knuckles, camera) and a
+# king-size neighbour piece envelope. Classification is margin-insensitive
+# in practice (true overlaps are all < 0, PASS minimum is ~80 mm); 2 mm is
+# the configured policy value, not a measured physical limit.
+neighbor_clearance_margin: 0.002
 log_path: /tmp/simplify-chess-game-execution.jsonl

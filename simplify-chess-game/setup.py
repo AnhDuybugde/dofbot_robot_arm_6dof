@@ -11,7 +11,8 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/config", [
             "config/home.yaml", "config/gripper.yaml", "config/safety.yaml",
-            "config/square_routes.yaml", "config/simplify_chess.rviz",
+            "config/square_routes.yaml", "config/piece_reachability.yaml",
+            "config/simplify_chess.rviz",
             "config/simplify_chess_lite.rviz",
         ]),
         ("share/" + package_name + "/launch", [
