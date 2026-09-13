@@ -5,11 +5,39 @@ calibration**. Nó không import MoveIt và không dùng OMPL, Cartesian planner
 IK/FK runtime, quaternion/orientation constraints, candidate offsets, IK seeds,
 hay replanning.
 
-Runtime chỉ thực hiện:
+Runtime chỉ thực hiện (mỗi leg là 1 goal nhiều điểm, RDP gộp đoạn thẳng):
 
 ```text
-HOME -> route(source) -> reverse(route(source)) -> route(target) -> reverse(route(target))
+HOME -> PICK (route source) -> HOME -> DROP (1 goal gộp) -> HOME
 ```
+
+## Chơi ngay sau khi pull
+
+Repo đã gồm đủ 64 route `VALIDATED` trong `config/square_routes.yaml`, chỉ cần:
+
+```bash
+pip install chess
+colcon build --packages-select simplify_chess_game
+source install/setup.bash
+```
+
+Terminal 1 (mở 1 lần duy nhất):
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch simplify_chess_game simplify_chess.launch.py
+```
+
+Terminal 2 (full game, seed 42, tay chỉ đi quân trắng):
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 run simplify_chess_game auto_play
+```
+
+Mọi nước cờ do python-chess sinh từ legal moves, không set cứng.
 
 Mỗi `route(square)` bắt đầu bằng `HOME_JOINTS`; route quay về là đúng
 `list(reversed(route(square)))`, không phải đảo dấu các joint angle.
@@ -155,12 +183,11 @@ move> quit
 chỉ chạy chiều `b2 -> HOME`, vì vậy trước lệnh này robot phải đang ở endpoint
 của b2 (thường dùng ngay sau khi teach hoặc sau khi chạy chiều đi).
 
-Lưu ý quan trọng: file mẫu chưa thể tự chạy một ván cờ ngay sau khi clone.
-Joint angle không thể suy ra an toàn chỉ từ XYZ; cần teach và xác nhận từng
-route trên phần cứng. Khi chưa có route hợp lệ, lệnh `b2 b4` sẽ fail-fast với
-`no validated route` thay vì gọi IK/planner hoặc tự đoán góc. Sau khi đủ 64
-route được đánh dấu `VALIDATED`, cùng một CLI sẽ chạy được mọi ô theo pipeline
-deterministic ở trên.
+Lưu ý quan trọng: repo đã commit đủ 64 route `VALIDATED` nên pull về chơi
+ngay được. Câu dưới chỉ còn đúng khi ai đó teach lại route mới: joint angle
+không thể suy ra an toàn chỉ từ XYZ; cần teach và xác nhận từng route trên
+phần cứng. Khi chưa có route hợp lệ, lệnh `b2 b4` sẽ fail-fast với
+`no validated route` thay vì gọi IK/planner hoặc tự đoán góc.
 
 Trong move bình thường gripper chỉ có `PRE_CLOSE`, `CLOSE`, `PRE_CLOSE`
 (release), cấu hình tại `config/gripper.yaml`. `piece_grip_adjustment` chỉ là

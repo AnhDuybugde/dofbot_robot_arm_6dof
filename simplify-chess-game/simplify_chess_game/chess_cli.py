@@ -14,8 +14,8 @@ HELP = "commands: home | test <square> | test-reverse <square> | status | list-r
 def main() -> None:
     parser = argparse.ArgumentParser(description="Calibrated chess route replay (no runtime planning/IK)")
     parser.add_argument("--routes", help="editable square_routes.yaml (default: installed config)")
-    parser.add_argument("--speed", type=float, default=1.5,
-                        help="motion speed multiplier 0.2..5.0 (default: 1.5)")
+    parser.add_argument("--speed", type=float, default=2.0,
+                        help="motion speed multiplier 0.2..5.0 (default: 2.0)")
     args = parser.parse_args()
     rclpy.init()
     node = ChessExecutor(routes_path=args.routes, speed_multiplier=args.speed)

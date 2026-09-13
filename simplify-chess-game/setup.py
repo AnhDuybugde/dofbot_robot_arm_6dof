@@ -18,7 +18,7 @@ setup(
             "launch/simplify_chess.launch.py",
         ]),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "chess"],
     zip_safe=True,
     entry_points={"console_scripts": [
         "chess_cli = simplify_chess_game.chess_cli:main",

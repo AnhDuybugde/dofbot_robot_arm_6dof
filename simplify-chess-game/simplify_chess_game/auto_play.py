@@ -10,6 +10,7 @@ chosen so no discard handling is needed.
 from __future__ import annotations
 
 import argparse
+import itertools
 import random
 import time
 
@@ -36,13 +37,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Auto-play calibrated chess: python-chess picks quiet moves, "
                     "arm replays validated routes (no runtime planning/IK)")
-    parser.add_argument("--moves", type=int, default=8,
-                        help="number of plies to play (default: 8)")
-    parser.add_argument("--seed", type=int, default=1,
-                        help="random seed for move choice (default: 1)")
+    parser.add_argument("--moves", type=int, default=0,
+                        help="number of plies to play (default: 0 = full game until game over)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="random seed for move choice (default: 42)")
     parser.add_argument("--routes", help="editable square_routes.yaml (default: installed config)")
-    parser.add_argument("--speed", type=float, default=1.5,
-                        help="motion speed multiplier 0.2..5.0 (default: 1.5)")
+    parser.add_argument("--speed", type=float, default=2.0,
+                        help="motion speed multiplier 0.2..5.0 (default: 2.0)")
     parser.add_argument("--move-both", action="store_true",
                         help="arm physically executes black moves too "
                              "(default: arm moves white only, black moves itself)")
@@ -50,14 +51,14 @@ def main() -> None:
     rclpy.init()
     node = ChessExecutor(routes_path=args.routes, speed_multiplier=args.speed)
     node.reset_pieces()
-    import time as _time
-    _time.sleep(0.5)  # let the visualizer receive reset before the first pick
+    time.sleep(0.5)  # let the visualizer receive reset before the first pick
     board = chess.Board()
     rng = random.Random(args.seed)
-    print(f"auto-play {args.moves} plies, seed={args.seed}")
+    full_game = args.moves <= 0
+    print(f"auto-play {'full game' if full_game else args.moves} plies, seed={args.seed}")
     print(board)
     try:
-        for i in range(args.moves):
+        for i in (itertools.count() if full_game else range(args.moves)):
             if board.is_game_over():
                 print(f"game over: {board.result()}")
                 break

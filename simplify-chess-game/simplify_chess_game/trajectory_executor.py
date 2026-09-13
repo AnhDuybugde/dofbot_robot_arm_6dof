@@ -149,23 +149,44 @@ class TrajectoryExecutor:
                 f"max_joint_err={max_err:.4f} rad); execution stopped")
 
     @staticmethod
-    def decimate(route: list[list[float]], threshold: float) -> list[list[float]]:
-        """Pure helper: drop near-duplicate intermediate waypoints.
+    def rdp_simplify(route: list[list[float]], eps: float) -> list[list[float]]:
+        """Pure helper: Douglas-Peucker in joint space (max-abs metric).
 
-        Keeps the first and last points; drops a middle point when every
-        joint is within `threshold` rad of the last kept point. Calibration
-        records dense points, so this cuts segment count (each costs at
-        least min_waypoint_duration) while preserving path shape.
+        Calibration records long near-straight creeps (dozens of 0.02 rad
+        steps); greedy distance filters cannot touch those, but RDP
+        collapses a straight run to its endpoints. Max joint deviation
+        from the recorded path stays <= eps; first/last points always kept.
         """
-        cleaned = [[float(q) for q in point] for point in route]
-        if len(cleaned) <= 2 or threshold <= 0.0:
-            return cleaned
-        kept = [cleaned[0]]
-        for point in cleaned[1:-1]:
-            if max(abs(a - b) for a, b in zip(point, kept[-1])) >= threshold:
-                kept.append(point)
-        kept.append(cleaned[-1])
-        return kept
+        points = [[float(q) for q in point] for point in route]
+        count = len(points)
+        if count <= 2 or eps <= 0.0:
+            return points
+
+        def deviation(index: int, left: list[float], right: list[float]) -> float:
+            direction = [b - a for a, b in zip(left, right)]
+            denom = sum(v * v for v in direction)
+            if denom < 1e-12:
+                return max(abs(p - a) for p, a in zip(points[index], left))
+            param = sum((p - a) * v for p, a, v in zip(points[index], left, direction))
+            param = max(0.0, min(1.0, param / denom))
+            return max(abs(p - (a + param * v))
+                       for p, a, v in zip(points[index], left, direction))
+
+        keep = [False] * count
+        keep[0] = keep[-1] = True
+        stack = [(0, count - 1)]
+        while stack:
+            first, last = stack.pop()
+            worst, winner = -1.0, -1
+            for index in range(first + 1, last):
+                distance = deviation(index, points[first], points[last])
+                if distance > worst:
+                    worst, winner = distance, index
+            if worst > eps:
+                keep[winner] = True
+                stack.append((first, winner))
+                stack.append((winner, last))
+        return [point for point, kept in zip(points, keep) if kept]
 
     @staticmethod
     def build_route_points(route: list[list[float]], start: list[float],
@@ -190,8 +211,9 @@ class TrajectoryExecutor:
         Intermediate points leave velocity unconstrained for smooth blending;
         only the final point stops (velocity 0), which also avoids the
         short-segment ABORT seen with nonzero endpoint velocities (b2 index 28).
-        Near-duplicate waypoints are decimated first (config
-        decimate_threshold_rad); the endpoint is always kept and verified.
+        Near-collinear recorded creeps are collapsed with RDP (config
+        rdp_eps_rad bounds the max joint deviation); the endpoint is
+        always kept and verified.
         """
         if not route:
             raise ExecutionError(f"{label}: empty route for {square}")
@@ -205,11 +227,11 @@ class TrajectoryExecutor:
         while len(route) > 1 and max(abs(a - b) for a, b in zip(route[0], start)) < 1e-3:
             route = route[1:]
         original = len(route)
-        route = self.decimate(route, float(self.config.get("decimate_threshold_rad", 0.0)))
+        route = self.rdp_simplify(route, float(self.config.get("rdp_eps_rad", 0.0)))
         if len(route) == 1:
             self.execute_waypoint(route[0], square=square, index=0, label=label)
             return
-        print(f"{label}: {original} -> {len(route)} waypoints after decimation")
+        print(f"{label}: {original} -> {len(route)} waypoints after RDP")
         timed, total = self.build_route_points(route, start, self._duration)
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = ARM_JOINTS
