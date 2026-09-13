@@ -2,9 +2,11 @@
 
 Tracks which piece stands on which square plus the piece currently carried
 by the gripper. ChessExecutor publishes pick/drop/reset events on
-/chess/piece_events; this node republishes the full MarkerArray at 5 Hz so
+/chess/piece_events; this node republishes the full MarkerArray at 20 Hz so
 a carried piece visibly follows the arm (via the Gripping_point_Link TF)
-instead of staying frozen on its start square.
+instead of staying frozen on its start square. 20 Hz (not 5 Hz) because the
+batched replay runs up to 2x speed and the piece would otherwise visibly
+step/lag behind the gripper between ticks.
 """
 from __future__ import annotations
 
@@ -63,7 +65,7 @@ class BoardVisualizer(Node):
         tf2_ros.TransformListener(self.tf, self)
         self.squares: dict[str, tuple[str, bool]] = initial_setup()
         self.carried: dict | None = None
-        self.create_timer(0.2, self.republish)
+        self.create_timer(0.05, self.republish)
 
     def on_piece_event(self, message: String) -> None:
         try:

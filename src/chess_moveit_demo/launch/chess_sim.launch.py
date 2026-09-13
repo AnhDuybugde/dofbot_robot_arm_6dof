@@ -34,6 +34,21 @@ def generate_launch_description():
             os.close(fd)
             raise RuntimeError(f"Chess simulation already running in ROS domain {domain}")
         session_lock.append(fd)
+        # simplify_* launches share node names (controller_manager,
+        # robot_state_publisher, spawners) and /chess/visual: refuse to
+        # co-run instead of corrupting both silently.
+        for other in ("simplify-backend", "simplify-rviz"):
+            opath = os.path.join(
+                tempfile.gettempdir(), f"dofbot-{other}-{os.getuid()}.lock")
+            ofd = os.open(opath, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                fcntl.flock(ofd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(ofd)
+                raise RuntimeError(
+                    f"simplify {other} already running (lock {opath}). "
+                    "Ctrl-C it first; chess_sim and simplify must NEVER run together.")
+            os.close(ofd)
         return [SetEnvironmentVariable("ROS_DOMAIN_ID", str(domain))]
 
     def release_session(context):

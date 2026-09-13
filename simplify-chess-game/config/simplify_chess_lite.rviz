@@ -11,7 +11,7 @@ Visualization Manager:
   - Class: rviz_default_plugins/RobotModel
     Name: Robot
     Description Source: File
-    Description File: /tmp/dofbot_simplify_full.urdf
+    Description File: /tmp/dofbot_simplify_lite.urdf
     Visual Enabled: true
     Collision Enabled: false
     Value: true

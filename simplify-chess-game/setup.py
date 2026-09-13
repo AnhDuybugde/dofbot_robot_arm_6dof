@@ -12,6 +12,7 @@ setup(
         ("share/" + package_name + "/config", [
             "config/home.yaml", "config/gripper.yaml", "config/safety.yaml",
             "config/square_routes.yaml", "config/simplify_chess.rviz",
+            "config/simplify_chess_lite.rviz",
         ]),
         ("share/" + package_name + "/launch", [
             "launch/simplify_backend.launch.py", "launch/simplify_rviz.launch.py",
