@@ -94,6 +94,19 @@ class BoardVisualizer(Node):
                 self.get_logger().info(f"capture on {square}: {captured} removed")
             self.squares[square] = (self.carried["kind"], self.carried["white"])
             self.carried = None
+        elif kind == "move":
+            # Opponent (black) move with no arm motion: teleport the piece so
+            # the display stays in sync with the python-chess game state.
+            source = str(event.get("from", "-")).lower()
+            target = str(event.get("to", "-")).lower()
+            piece = self.squares.pop(source, None)
+            if piece is None:
+                self.get_logger().warn(f"move from empty square {source}; ignored")
+                return
+            captured = self.squares.get(target)
+            if captured is not None:
+                self.get_logger().info(f"capture on {target}: {captured} removed")
+            self.squares[target] = piece
         else:
             self.get_logger().warn(f"unknown piece event: {message.data!r}")
 

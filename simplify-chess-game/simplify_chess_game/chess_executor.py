@@ -74,6 +74,16 @@ class ChessExecutor(Node):
         self.trajectory_executor.execute_waypoint(
             self.home["home_joints"], square="HOME", index=0, label="HOME confirmed")
 
+    def home_if_needed(self) -> None:
+        """Skip the HOME goal when already standing on HOME (saves a full stop)."""
+        actual = self.trajectory_executor.wait_for_joint_state()
+        tolerance = float(self.home.get("home_tolerance_rad", 0.08))
+        if all(abs(a - h) <= tolerance
+               for a, h in zip(actual, self.home["home_joints"])):
+            print("already HOME, skip")
+            return
+        self.home_robot()
+
     def set_gripper(self, state: str, square: str) -> None:
         self.gripper.set(state, square)
         self.gripper_state = state
@@ -100,6 +110,16 @@ class ChessExecutor(Node):
         """Tell the visualizer to restore the initial 32-piece setup."""
         self._publish_piece("reset")
 
+    def announce_move(self, source: str, target: str) -> None:
+        """Visualize an opponent (black) move with no arm motion.
+
+        The visualizer teleports the piece source -> target so the board
+        display stays in sync with the python-chess game state.
+        """
+        message = String()
+        message.data = json.dumps({"event": "move", "from": source, "to": target})
+        self.piece_pub.publish(message)
+
     def _timed(self, title: str, func, *args, **kwargs) -> None:
         started = time.monotonic()
         func(*args, **kwargs)
@@ -109,9 +129,12 @@ class ChessExecutor(Node):
         # Lookup first so missing/disabled routes fail before the robot starts moving.
         source_route = self.db.executable_route(source)
         target_route = self.db.executable_route(target)
+        # One continuous PICK -> HOME -> DROP leg instead of two goals with a
+        # full stop at HOME in between; the junction HOME point is deduplicated.
+        carry_route = list(reversed(source_route)) + target_route[1:]
         print(f"MOVE {source} -> {target}")
         print("[1] HOME confirmed")
-        self._timed("    home", self.home_robot)
+        self._timed("    home", self.home_if_needed)
         print("[2] gripper PRE_CLOSE")
         self.set_gripper("PRE_CLOSE", source)
         print(f"[3] execute HOME -> {source}")
@@ -121,18 +144,14 @@ class ChessExecutor(Node):
         print("[4] gripper CLOSE")
         self.set_gripper("CLOSE", source)
         self._publish_piece("pick", source)
-        print(f"[5] execute {source} -> HOME")
-        self._timed(f"    {source} -> HOME",
+        print(f"[5] execute {source} -> HOME -> {target}")
+        self._timed(f"    {source} -> HOME -> {target}",
                     self.trajectory_executor.execute_route,
-                    list(reversed(source_route)), square=source, label="PICK -> HOME")
-        print(f"[6] execute HOME -> {target}")
-        self._timed(f"    HOME -> {target}",
-                    self.trajectory_executor.execute_route,
-                    target_route, square=target, label="HOME -> DROP")
-        print("[7] gripper PRE_CLOSE / RELEASE")
+                    carry_route, square=target, label="PICK -> HOME -> DROP")
+        print("[6] gripper PRE_CLOSE / RELEASE")
         self.set_gripper("PRE_CLOSE", target)
         self._publish_piece("drop", target)
-        print(f"[8] execute {target} -> HOME")
+        print(f"[7] execute {target} -> HOME")
         self._timed(f"    {target} -> HOME",
                     self.trajectory_executor.execute_route,
                     list(reversed(target_route)), square=target, label="DROP -> HOME")

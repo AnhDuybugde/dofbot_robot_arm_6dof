@@ -1,14 +1,17 @@
 """Auto-play chess without manual control: python-chess generates the moves.
 
-Each ply runs the same deterministic pipeline as the manual CLI:
-HOME -> route(source) -> reverse -> route(target) -> reverse, with
-PRE_CLOSE / CLOSE / RELEASE gripper steps. Only quiet moves (no capture,
-no promotion, no castling) are chosen so no discard handling is needed.
+White plies run the deterministic arm pipeline (HOME -> PICK -> HOME ->
+DROP -> HOME with gripper steps). Black plies are opponent moves: no arm
+motion, the board display just follows the python-chess game state.
+Nothing is hard-coded; every move comes from python-chess legal move
+generation. Only quiet moves (no capture, no promotion, no castling) are
+chosen so no discard handling is needed.
 """
 from __future__ import annotations
 
 import argparse
 import random
+import time
 
 import chess
 import rclpy
@@ -40,6 +43,9 @@ def main() -> None:
     parser.add_argument("--routes", help="editable square_routes.yaml (default: installed config)")
     parser.add_argument("--speed", type=float, default=1.5,
                         help="motion speed multiplier 0.2..5.0 (default: 1.5)")
+    parser.add_argument("--move-both", action="store_true",
+                        help="arm physically executes black moves too "
+                             "(default: arm moves white only, black moves itself)")
     args = parser.parse_args()
     rclpy.init()
     node = ChessExecutor(routes_path=args.routes, speed_multiplier=args.speed)
@@ -57,7 +63,14 @@ def main() -> None:
                 break
             move = pick_move(board, rng)
             uci = move.uci()
-            print(f"[{i + 1}] {board.san(move)} ({uci})")
+            side = "white" if board.turn == chess.WHITE else "black"
+            print(f"[{i + 1}] {side}: {board.san(move)} ({uci})")
+            if board.turn == chess.BLACK and not args.move_both:
+                board.push(move)
+                node.announce_move(uci[:2], uci[2:4])
+                time.sleep(1.0)  # let the display update read as a turn
+                print(board)
+                continue
             try:
                 node.move(uci[:2], uci[2:4])
             except (ExecutionError, RuntimeError) as exc:

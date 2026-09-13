@@ -149,6 +149,25 @@ class TrajectoryExecutor:
                 f"max_joint_err={max_err:.4f} rad); execution stopped")
 
     @staticmethod
+    def decimate(route: list[list[float]], threshold: float) -> list[list[float]]:
+        """Pure helper: drop near-duplicate intermediate waypoints.
+
+        Keeps the first and last points; drops a middle point when every
+        joint is within `threshold` rad of the last kept point. Calibration
+        records dense points, so this cuts segment count (each costs at
+        least min_waypoint_duration) while preserving path shape.
+        """
+        cleaned = [[float(q) for q in point] for point in route]
+        if len(cleaned) <= 2 or threshold <= 0.0:
+            return cleaned
+        kept = [cleaned[0]]
+        for point in cleaned[1:-1]:
+            if max(abs(a - b) for a, b in zip(point, kept[-1])) >= threshold:
+                kept.append(point)
+        kept.append(cleaned[-1])
+        return kept
+
+    @staticmethod
     def build_route_points(route: list[list[float]], start: list[float],
                            duration_fn) -> tuple[list[tuple[list[float], float]], float]:
         """Pure helper: cumulative time_from_start per waypoint. Unit-testable."""
@@ -171,17 +190,26 @@ class TrajectoryExecutor:
         Intermediate points leave velocity unconstrained for smooth blending;
         only the final point stops (velocity 0), which also avoids the
         short-segment ABORT seen with nonzero endpoint velocities (b2 index 28).
+        Near-duplicate waypoints are decimated first (config
+        decimate_threshold_rad); the endpoint is always kept and verified.
         """
         if not route:
             raise ExecutionError(f"{label}: empty route for {square}")
-        if len(route) == 1:
-            self.execute_waypoint(route[0], square=square, index=0, label=label)
-            return
         for target in route:
             if len(target) != 5:
                 raise ExecutionError("target must contain arm1..arm5")
         self.wait_ready()
         start = self.wait_for_joint_state()
+        # Drop leading points we already stand on (routes start at HOME and
+        # chained legs revisit it); the endpoint is never dropped.
+        while len(route) > 1 and max(abs(a - b) for a, b in zip(route[0], start)) < 1e-3:
+            route = route[1:]
+        original = len(route)
+        route = self.decimate(route, float(self.config.get("decimate_threshold_rad", 0.0)))
+        if len(route) == 1:
+            self.execute_waypoint(route[0], square=square, index=0, label=label)
+            return
+        print(f"{label}: {original} -> {len(route)} waypoints after decimation")
         timed, total = self.build_route_points(route, start, self._duration)
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = ARM_JOINTS
