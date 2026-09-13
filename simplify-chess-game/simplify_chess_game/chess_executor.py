@@ -9,6 +9,7 @@ from pathlib import Path
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
+from std_msgs.msg import String
 import yaml
 
 from .gripper_controller import GripperController
@@ -32,10 +33,13 @@ def load_yaml(path: str | Path) -> dict:
 
 
 class ChessExecutor(Node):
-    def __init__(self, *, routes_path: str | Path | None = None):
+    def __init__(self, *, routes_path: str | Path | None = None,
+                 speed_multiplier: float | None = None):
         super().__init__("simplify_chess_executor")
         self.home = load_yaml(config_path("home.yaml"))
         self.safety = load_yaml(config_path("safety.yaml"))
+        if speed_multiplier is not None:
+            self.safety["speed_multiplier"] = float(speed_multiplier)
         self.gripper_config = load_yaml(config_path("gripper.yaml"))
         self.db = RouteDatabase(routes_path or default_routes_path(),
                                 self.home["home_joints"], self.home["home_tolerance_rad"])
@@ -44,6 +48,13 @@ class ChessExecutor(Node):
         self.gripper = GripperController(self, self.safety, self.gripper_config, self._log)
         self.log_path = Path(self.safety["log_path"])
         self.gripper_state = "UNKNOWN"
+        # Board visualizer listens here to track the carried piece.
+        self.piece_pub = self.create_publisher(String, "/chess/piece_events", 10)
+
+    def _publish_piece(self, event: str, square: str = "-") -> None:
+        message = String()
+        message.data = json.dumps({"event": event, "square": square})
+        self.piece_pub.publish(message)
 
     def _log(self, *, square, trajectory_index, target, actual, label, success,
              gripper_state=None) -> None:
@@ -85,29 +96,46 @@ class ChessExecutor(Node):
         self.trajectory_executor.execute_route(
             list(reversed(route)), square=square, label="square -> HOME reverse test")
 
+    def reset_pieces(self) -> None:
+        """Tell the visualizer to restore the initial 32-piece setup."""
+        self._publish_piece("reset")
+
+    def _timed(self, title: str, func, *args, **kwargs) -> None:
+        started = time.monotonic()
+        func(*args, **kwargs)
+        print(f"{title} ({time.monotonic() - started:.1f}s)")
+
     def move(self, source: str, target: str) -> None:
         # Lookup first so missing/disabled routes fail before the robot starts moving.
         source_route = self.db.executable_route(source)
         target_route = self.db.executable_route(target)
         print(f"MOVE {source} -> {target}")
         print("[1] HOME confirmed")
-        self.home_robot()
+        self._timed("    home", self.home_robot)
         print("[2] gripper PRE_CLOSE")
         self.set_gripper("PRE_CLOSE", source)
         print(f"[3] execute HOME -> {source}")
-        self.trajectory_executor.execute_route(source_route, square=source, label="HOME -> PICK")
+        self._timed(f"    HOME -> {source}",
+                    self.trajectory_executor.execute_route,
+                    source_route, square=source, label="HOME -> PICK")
         print("[4] gripper CLOSE")
         self.set_gripper("CLOSE", source)
+        self._publish_piece("pick", source)
         print(f"[5] execute {source} -> HOME")
-        self.trajectory_executor.execute_route(
-            list(reversed(source_route)), square=source, label="PICK -> HOME")
+        self._timed(f"    {source} -> HOME",
+                    self.trajectory_executor.execute_route,
+                    list(reversed(source_route)), square=source, label="PICK -> HOME")
         print(f"[6] execute HOME -> {target}")
-        self.trajectory_executor.execute_route(target_route, square=target, label="HOME -> DROP")
+        self._timed(f"    HOME -> {target}",
+                    self.trajectory_executor.execute_route,
+                    target_route, square=target, label="HOME -> DROP")
         print("[7] gripper PRE_CLOSE / RELEASE")
         self.set_gripper("PRE_CLOSE", target)
+        self._publish_piece("drop", target)
         print(f"[8] execute {target} -> HOME")
-        self.trajectory_executor.execute_route(
-            list(reversed(target_route)), square=target, label="DROP -> HOME")
+        self._timed(f"    {target} -> HOME",
+                    self.trajectory_executor.execute_route,
+                    list(reversed(target_route)), square=target, label="DROP -> HOME")
         print("MOVE COMPLETE")
 
     def status(self) -> str:

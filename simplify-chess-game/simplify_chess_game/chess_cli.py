@@ -8,15 +8,17 @@ from .chess_executor import ChessExecutor
 from .trajectory_executor import ExecutionError
 
 
-HELP = "commands: home | test <square> | test-reverse <square> | status | list-routes | <source> <target> | quit"
+HELP = "commands: home | test <square> | test-reverse <square> | status | list-routes | reset-pieces | <source> <target> | quit"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Calibrated chess route replay (no runtime planning/IK)")
     parser.add_argument("--routes", help="editable square_routes.yaml (default: installed config)")
+    parser.add_argument("--speed", type=float, default=1.5,
+                        help="motion speed multiplier 0.2..5.0 (default: 1.5)")
     args = parser.parse_args()
     rclpy.init()
-    node = ChessExecutor(routes_path=args.routes)
+    node = ChessExecutor(routes_path=args.routes, speed_multiplier=args.speed)
     print(HELP)
     try:
         while rclpy.ok():
@@ -34,6 +36,9 @@ def main() -> None:
                     node.home_robot()
                 elif command == ["status"]:
                     print(node.status())
+                elif command == ["reset-pieces"]:
+                    node.reset_pieces()
+                    print("piece display reset to initial setup")
                 elif command == ["list-routes"]:
                     print("\n".join(node.list_routes()))
                 elif len(command) == 2 and command[0] == "test":
